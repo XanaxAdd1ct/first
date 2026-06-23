@@ -291,5 +291,5 @@ CGO\_ENABLED=0 go build -ldflags="-s -w" -o coordinator .
 при запуске программы и не читается из настроек
 
 ## License
-This project is licensed under the MIT License — see the \[LICENSE](./LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](./LICENSE) file for details.
 
