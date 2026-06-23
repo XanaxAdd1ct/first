@@ -1,281 +1,156 @@
-\# CGSystem — CoordinatorGoSystem
-
-
-
-HTTP API сервер для централизованного управления доменными конфигурациями
-
-в системе распределённых агентов.
-
-
-
-\## Назначение
-
-
-
+# CGSystem — CoordinatorGoSystem
+## HTTP API сервер для централизованного управления доменными конфигурациями в системе распределённых агентов.
+# Назначение
 Coordinator обеспечивает мгновенное переключение трафика на зеркальный
-
 домен при недоступности основного сервера. Агенты периодически запрашивают
+актуальную конфигурацию. При обновлении домена администратором все агенты
+получают новый адрес на следующей проверке.
+- хранит текущую доменную конфигурацию в Redis
+- отдаёт агентам подписанный payload с конфигом
+- позволяет обновлять домен и redirect target через admin API
+- поддерживает ротацию HMAC-ключей
+- экспортирует метрики для Prometheus
+- ограничивает частоту запросов по IP
+- корректно завершается по сигналам ОС
+## Стек:
+- Go 1.22
+- Gin — HTTP API
+- Redis — хранение состояния
+- Prometheus — метрики
+- HMAC-SHA256 — подпись payload-ов
+- ulule/limiter — rate limiting
+- envconfig — конфигурация через переменные окружения
+- testify, miniredis — тесты
+## API
 
-актуальную конфигурацию — при обновлении домена администратором все агенты
-
-получают новый адрес на следующем checkin-е.
-
-
-
-\- хранит текущую доменную конфигурацию в Redis
-
-\- отдаёт агентам подписанный payload с конфигом
-
-\- позволяет обновлять домен и redirect target через admin API
-
-\- поддерживает ротацию HMAC-ключей
-
-\- экспортирует метрики для Prometheus
-
-\- ограничивает частоту запросов по IP
-
-\- корректно завершается по сигналам ОС
-
-
-
-Стек
-
-Go 1.22
-
-Gin — HTTP API
-
-Redis — хранение состояния
-
-Prometheus — метрики
-
-HMAC-SHA256 — подпись payload-ов
-
-ulule/limiter — rate limiting
-
-envconfig — конфигурация через переменные окружения
-
-testify, miniredis — тесты
-
-API
-
-Public endpoints
-
-Method	Path	Описание
-
-GET	/health	Проверка, что сервис запущен и Redis доступен
-
-GET	/metrics	Метрики Prometheus
-
-POST	/api/v1/agent/checkin	Получить актуальную конфигурацию
-
-Admin endpoints
-
-Для admin-методов нужен Bearer token.
-
-
-
-Method	Path	Описание
-
-POST	/api/v1/admin/update\_domain	Обновить домен и redirect target
-
-POST	/api/v1/admin/rotate\_key	Поменять HMAC-ключ
-
-Пример: checkin агента
-
+### Public endpoints
+| Method | Path | Описание |
+|---|---|---|
+| `GET` | /health | Проверка, что сервис запущен и Redis доступен |
+| `GET` | /metrics | Метрики Prometheus |
+| `POST` | /api/v1/agent/checkin | Получить актуальную конфигурацию Admin endpoints |
+Для admin-методов нужен Bearer token
+| Method | Path | Описание |
+|---|---|---|
+| `POST` | /api/v1/admin/update\_domain | Обновить домен и redirect target |
+| `POST` |  /api/v1/admin/rotate\_key | Поменять HMAC-ключ |
+### checkin агента
 POST /api/v1/agent/checkin
+агент может передать `agent_id` в адресе запроса  если не передан  сервис сам сгенерирует uuid
+| параметр | тип | обязательный |
+|---|---|---|
+| `agent_id` | string | нет |
 
-
-
-Агент может передать agent\_id в query params. Если не передан, сервис сам сгенерирует UUID.
-
-
-
-Query params:
-
-
-
-agent\_id — optional
-
-
-
-
-
-Пример ответа:
-
-(json)
-
-
-
+**ответ `200`**
+```json
 {
-
-&#x20; "action": "update\_domain",
-
-&#x20; "agent\_id": "550e8400-e29b-41d4-a716-446655440000",
-
-&#x20; "key\_version": 3,
-
-&#x20; "signature": "a3f1c2d4...",
-
-&#x20; "payload": {
-
-&#x20;   "primary\_domain": "example.com",
-
-&#x20;   "redirect\_target": "https://mirror.example.com",
-
-&#x20;   "version": 7,
-
-&#x20;   "updated\_at": "2026-06-18T08:00:00Z"
-
-&#x20; }
-
+"action": "update_domain",
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "key_version": 3,
+  "signature": "a3f1c2d4...",
+  "payload": {
+ "primary_domain": "example.com",
+    "redirect_target": "https://mirror.example.com",
+    "version": 7,
+ "updated_at": "2026-06-18T08:00:00Z"
+  }
 }
 
+```
+### Пример: обновление домена
 
-
-Пример: обновление домена
-
-(bash)
-
-
-
-curl -X POST http://localhost:8080/api/v1/admin/update\_domain \\
-
-&#x20; -H "Authorization: Bearer <token>" \\
-
-&#x20; -H "Content-Type: application/json" \\
-
-&#x20; -d '{"primary\_domain":"example.com","redirect\_target":"https://mirror.example.com"}'
-
-
-
+POST /api/v1/admin/update_domain
+```(bash)
+curl -X POST http://localhost:8080/api/v1/admin/update_domain \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"primary_domain":"example.com","redirect_target":"https://mirror.example.com"}'
+```
 Request body:
-
-(json)
-
-
-
+```(json)
 {
-
-&#x20; "primary\_domain": "example.com",
-
-&#x20; "redirect\_target": "https://mirror.example.com"
-
+  "primary\_domain": "example.com",
+  "redirect\_target": "https://mirror.example.com"
 }
-
-
 
 Response:
-
-(json)
-
-
+```(json)
 
 {
-
-&#x20; "status": "ok",
-
-&#x20; "version": 8
-
+  "status": "ok",
+  "version": 8
 }
 
-
-
-Пример: ротация ключа
-
-(bash)
-
-
-
-Копировать код
-
+```
+### Пример: ротация ключа
+```(bash)
 curl -X POST http://localhost:8080/api/v1/admin/rotate\_key \\
+  -H "Authorization: Bearer <token>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"new\_secret":"<min-32-chars-random-string>"}'
 
-&#x20; -H "Authorization: Bearer <token>" \\
-
-&#x20; -H "Content-Type: application/json" \\
-
-&#x20; -d '{"new\_secret":"<min-32-chars-random-string>"}'
-
-
-
+  ```
 Response:
-
-(json)
-
-
-
+```(json)
 {
-
-&#x20; "status": "ok",
-
-&#x20; "key\_id": 4
-
+  "status": "ok",
+  "key\_id": 4
 }
 
-
-
-Как устроена подпись
+```
+### Как устроена подпись:
 
 Payload подписывается через HMAC-SHA256.
-
 Для подписи используется канонический JSON: ключи сортируются, чтобы результат не зависел от порядка полей.
-
 HMAC-SHA256(sort\_keys(json(payload)), secret)
+После ротации старый ключ ещё какое-то время остаётся валидным, чтобы агенты могли спокойно обработать уже полученные 
+данные. Старые ключи очищаются автоматически.
 
-После ротации старый ключ ещё какое-то время остаётся валидным, чтобы агенты могли спокойно обработать уже полученные данные. Старые ключи очищаются автоматически.
 
-## architecture
+## Аритектура
 
 сервис построен вокруг одной идеи  всё состояние системы это одна запись в redis
 никаких очередей никаких event-шин  агент пришёл получил подписанный конфиг и ушёл
 coordinator при этом не хранит состояние сам  можно поднять несколько копий
 за балансировщиком и они не будут мешать друг другу
 
-### поток данных
-### ключевые решения
+## Ключевые решения
 
 **оптимистичная блокировка вместо пессимистичной**
 
 UpdateDomain использует WATCH/MULTI/EXEC  конфиг домена меняется редко
 и только вручную  конфликты практически исключены  пессимистичный lock
 был бы лишним и мог бы стать точкой отказа
-
 **канонический json для подписи**
-
 encoding/json не гарантирует порядок ключей при сериализации map
 перед вычислением hmac ключи сортируются по алфавиту  подпись
 получается одинаковая  независимо от порядка полей в payload
-
 **ротация ключей без остановки сервиса**
-
 при вызове POST /api/v1/admin/rotate_key новый ключ становится активным
 сразу  старый остаётся в keyring ещё 1 час  агенты успевают проверить
 payload-ы полученные до ротации  ключи старше 48 часов удаляются сами
-
 **тип secret для конфигурации**
-
 чувствительные значения HMAC_SECRET и ADMIN_TOKEN обёрнуты в тип secret
 fmt.Sprintf  логгер и отладчик получат "***" вместо реального значения
 достать строку можно только явно через .Value()
-
 **dependency injection без фреймворков**
-
 все зависимости Storage KeyRinger *slog.Logger prometheus.Registerer
 передаются в конструктор New() явно  глобальных переменных нет  в тестах
 каждый компонент подменяется  независимо
 
-### структура пакета
+## структура пакета
 
-coordinator/
-├── main.go # сборка зависимостей graceful shutdown
-├── config.go # конфиг из env тип secret валидация
-├── api.go # обработчики запросов rate limiting авторизация
-├── storage.go # redis: GetDomain / UpdateDomain (WATCH/MULTI/EXEC)
-├── crypto.go # keyring hmac-sha256 canonical json
-├── metrics.go # prometheus: счётчики запросов ошибок версии домена
-└── logger.go # json логгер через slog
+### coordinator/
 
-### покрытие тестами
+- main.go # сборка зависимостей graceful shutdown
+- config.go # конфиг из env тип secret валидация
+- api.go # обработчики запросов rate limiting авторизация
+- storage.go # redis: GetDomain / UpdateDomain (WATCH/MULTI/EXEC)
+- crypto.go # keyring hmac-sha256 canonical json
+- metrics.go # prometheus: счётчики запросов ошибок версии домена
+- logger.go # json логгер через slog
+
+### Покрытие тестами
 
 | файл | что тестируется |
 |---|---|
@@ -285,156 +160,77 @@ coordinator/
 | `config_test.go` | валидация всех переменных  граничные случаи |
 | `main_test.go` | graceful shutdown  порядок инициализации |
 | `ratelimit_test.go` | превышение лимита  сброс после периода |
-
 внешние зависимости для тестов не нужны  redis эмулируется через miniredis
 
 ## Конфигурация
 
-
-
 Все параметры сервиса задаются через переменные окружения. Пример конфигурации есть в файле `.env.example`.
-
-
-
 | Переменная | Обязательная | Значение по умолчанию | Описание |
-
 |---|---|---|---|
-
 | `ADMIN\_TOKEN` | да | — | Bearer token для доступа к admin API |
-
 | `HMAC\_SECRET` | да | — | начальный секрет для HMAC-подписи |
-
 | `REDIS\_URL` | да | — | адрес Redis, например `redis://host:6379/0` |
-
 | `DEFAULT\_DOMAIN` | да | — | домен, который используется при первом запуске |
-
 | `DEFAULT\_REDIRECT` | да | — | redirect target, который используется при первом запуске |
-
 | `LISTEN\_ADDR` | нет | `:8080` | адрес, на котором запускается HTTP-сервер |
-
 | `REDIS\_TTL` | нет | `24h` | время жизни конфигурации в Redis |
-
 | `LOG\_LEVEL` | нет | `info` | уровень логирования: `debug`, `info`, `warn`, `error` |
 
 Быстрый запуск
 
-(bash)
-
-
-
-
-
-\# 1. Подготовить env
-
+```(bash)
+- 1. Подготовить env
 cp ../.env.example ../.env
-
-
-
-\# 2. Поднять Redis
-
+- 2. Поднять Redis
 docker-compose -f ../docker-compose.yml up -d redis
-
-
-
-\# 3. Запустить сервис
-
+- 3. Запустить сервис
 go run .
-
-
-
-\# 4. Проверить
-
+- 4. Проверить
 curl http://localhost:8080/health
 
-
-
+```
 Все ок — вернет:
 
-{"status":"ok"}
-
-
+```{"status":"ok"}```
 
 Тесты
 
-(bash)
-
-
-
+```(bash)
 go test ./... -v -coverprofile=coverage.out
-
 go tool cover -html=coverage.out -o coverage.html
+go test -race ./…
+```
+Покрытие тестами — 90.8%. Это честное покрытие для production сервиса
+оставшиеся 9.2% это либо main() который не тестируют нигде либо ветки которые срабатывают только при повреждённых данных в памяти. 
 
-go test -race ./...
+Main() и run() исключены намеренно — 
+точка входа не покрывается unit тестами по стандарту Go 
 
-
-
-Покрытие тестами — 90.5%+. 
-
-
-
-Redis-слой тестируется через miniredis, поэтому для unit-тестов не нужно отдельно поднимать Redis.
-
-
-
-Сборка
-
-(bash)
-
-
-
+```(bash)
 go build -o coordinator .
 
-
-
+```
 Для более компактного production-бинаря:
-
-(bash)
-
-
-
-
-
+```(bash)
 CGO\_ENABLED=0 go build -ldflags="-s -w" -o coordinator .
 
-
-
-\## Метрики
-
-
-
+```
 Сервис отдаёт метрики в формате Prometheus на эндпоинте `GET /metrics`.
-
-
-
 | Метрика | Тип | Labels | Описание |
-
 |---|---|---|---|
-
 | `coordinator\_requests\_total` | Counter | `endpoint` | Общее количество запросов |
-
 | `coordinator\_errors\_total` | Counter | `endpoint`, `code` | Общее количество ошибок |
-
 | `coordinator\_domain\_version` | Gauge | `domain` | Текущая версия конфигурации домена |
 
+## В будущем если буду развивать проект добавлю:
 
-Что можно улучшить:
+- swagger / openapi описание
+- интеграционные тесты поверх реального Redis
+- docker image для сервиса
+- audit log для admin-операций
+- более гибкую модель версионирования конфигурации 
 
-Если развивать проект, я бы добавил:
-
-
-
-swagger / openapi описание
-
-интеграционные тесты поверх реального Redis
-
-docker image для сервиса
-
-audit log для admin-операций
-
-более гибкую модель версионирования конфигурации 
-
-
-## словарь
+## Словарь
 
 **redis** — база данных которая хранит данные в оперативной памяти а не на диске
 поэтому работает очень быстро  используется как общее хранилище для всех копий сервиса
@@ -494,11 +290,6 @@ audit log для admin-операций
 **захардкодить** — вписать значение прямо в код руками  оно не меняется
 при запуске программы и не читается из настроек
 
-
-
-\## License
-
-
-
+## License
 This project is licensed under the MIT License — see the \[LICENSE](./LICENSE) file for details.
 
