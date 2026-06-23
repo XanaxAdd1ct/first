@@ -104,19 +104,23 @@ func NewStorage(redisURL string, ttl time.Duration) (*RedisStorage, error) {
     return &RedisStorage{rdb: rdb, ttl: ttl}, nil
 }
 
-// GetDomain читает текущий конфиг домена из Redis
-//
-// возвращает ErrNotFound если ключа нет  первый старт сервиса
-// все остальные ошибки Redis пробрасываются наверх
+// Close закрывает соединение с redis
+// вызывается через defer в run()  гарантирует освобождение соединения
+// при любом завершении программы  штатном или аварийном
 
 func (s *RedisStorage) Close() error {
     return s.rdb.Close()
 }
-
+// Ping проверяет доступность redis
+// используется в handleHealth  не несёт бизнес логики
+// просто отправляет ping и возвращает ошибку если redis недоступен
 func (s *RedisStorage) Ping(ctx context.Context) error {
     return s.rdb.Ping(ctx).Err()
 }
-
+// GetDomain читает текущий конфиг домена из Redis
+//
+// возвращает ErrNotFound если ключа нет  первый старт сервиса
+// все остальные ошибки Redis пробрасываются наверх
 func (s *RedisStorage) GetDomain(ctx context.Context) (*DomainConfig, error) {
     val, err := s.rdb.Get(ctx, domainConfigKey).Result()
     if errors.Is(err, redis.Nil) {
