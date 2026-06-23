@@ -5,7 +5,7 @@
 """
 import json, subprocess, time, sys
 
-LOG_FILE = "/main/log.json"  # путь к JSON-логам
+LOG_FILE = "logs.json"  # путь к JSON-логам
 MODE = "infect" 
 
 def process_event(ip, event_type):
