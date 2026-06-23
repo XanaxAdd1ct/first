@@ -1,0 +1,65 @@
+HTTPS + TLS — защита транспортного уровня
+==========================================
+
+ПРОБЛЕМА
+--------
+без TLS все данные между клиентом и сервером летят в открытом виде
+bearer token в заголовке Authorization виден любому кто сидит в той же сети
+достаточно запустить wireshark в кафе и перехватить токен за секунды
+
+РЕШЕНИЕ
+-------
+TLS шифрует весь трафик между клиентом и сервером
+даже если кто то перехватит пакеты  он увидит только зашифрованный мусор
+
+КАК ПОЛУЧИТЬ СЕРТИФИКАТ
+------------------------
+бесплатно через let's encrypt
+
+    # устанавливаем certbot
+    apt install certbot
+
+    # получаем сертификат
+    certbot certonly --standalone -d your-domain.com
+
+    # сертификаты появятся здесь
+    /etc/letsencrypt/live/your-domain.com/fullchain.pem  <- это TLS_CERT_FILE
+    /etc/letsencrypt/live/your-domain.com/privkey.pem    <- это TLS_KEY_FILE
+
+    # автообновление  сертификат живёт 90 дней
+    certbot renew --dry-run
+
+КАК НАСТРОИТЬ
+-------------
+добавь в .env
+
+    TLS_CERT_FILE=/etc/letsencrypt/live/your-domain.com/fullchain.pem
+    TLS_KEY_FILE=/etc/letsencrypt/live/your-domain.com/privkey.pem
+
+если переменные не заданы  сервер запустится без TLS
+в логах увидишь предупреждение:
+    WARN  TLS not configured  running without HTTPS
+
+ПОЧЕМУ TLS 1.3
+--------------
+TLS 1.0 и 1.1 — взломаны  POODLE BEAST атаки
+TLS 1.2 — условно безопасен при правильных настройках
+TLS 1.3 — полностью переработан  убраны все устаревшие алгоритмы
+          быстрее  проще  безопаснее
+
+ПОЧЕМУ X25519 и P256
+--------------------
+это кривые для обмена ключами
+X25519 — современная  быстрая  нет известных уязвимостей
+P256   — совместимость со старыми клиентами
+
+ПРОВЕРКА ПОСЛЕ ЗАПУСКА
+----------------------
+    # проверить сертификат
+    openssl s_client -connect your-domain.com:8080
+
+    # проверить версию TLS
+    curl -v https://your-domain.com:8080/health
+
+    # онлайн проверка
+    https://www.ssllabs.com/ssltest/
