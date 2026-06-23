@@ -78,6 +78,7 @@ type Server struct {
     metrics     *serverMetrics
     router      *gin.Engine
     rateLimiter gin.HandlerFunc 
+ securityMonitor *SecurityMonitor 
 }
 
 
@@ -118,6 +119,7 @@ func New(
         keyRing: keyRing,
         log:     log,
         metrics: m,
+        securityMonitor: NewSecurityMonitor(log),
     }
     s.router = s.buildRouter()
     return s, nil
@@ -146,6 +148,7 @@ func (s *Server) buildRouter() *gin.Engine {
     r.Use(gin.Recovery())
     r.Use(s.structuredLogger())
     r.Use(cors.Default())
+    r.Use(SecurityMiddleware(s.securityMonitor))
 
     if s.rateLimiter != nil {
         r.Use(s.rateLimiter)
