@@ -46,6 +46,7 @@ type APIConfig struct {
     AdminToken      string
     DefaultDomain   string
     DefaultRedirect string
+    AdminAllowedIPs []string
 }
 
 // DomainPayload данные которые сервер отдаёт агенту при checkin
@@ -79,6 +80,7 @@ type Server struct {
     router      *gin.Engine
     rateLimiter gin.HandlerFunc 
  securityMonitor *SecurityMonitor 
+     nonces          *nonceStore
 }
 
 
