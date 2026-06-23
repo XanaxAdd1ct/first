@@ -1,3 +1,6 @@
+// точка входа для http сервера  здесь собирается роутер  middleware и все хендлеры
+// сервер намеренно не знает ничего про конфиг и redis напрямую
+// всё приходит через интерфейсы  это позволяет подменять зависимости в тестах
 package main
 
 import (
@@ -26,6 +29,9 @@ const (
     minTokenLen     = 32
 )
 
+// KeyRinger интерфейс для подписи и верификации payload-ов
+// вынесен в интерфейс чтобы в тестах можно было подменить на mock
+// и проверить поведение хендлеров при ошибках подписи
 type KeyRinger interface {
     Sign(payload map[string]interface{}) (signature string, keyID int, err error)
     Verify(payload map[string]interface{}, signature string, keyID int) error
@@ -33,19 +39,26 @@ type KeyRinger interface {
     CurrentID() int
 }
 
+// APIConfig минимальный конфиг который нужен серверу
+// намеренно отделён от общего Config  хендлерам не нужно знать
+// про redis url или log level  только то что реально используется
 type APIConfig struct {
     AdminToken      string
     DefaultDomain   string
     DefaultRedirect string
 }
 
+// DomainPayload данные которые сервер отдаёт агенту при checkin
+// это то что подписывается hmac  поэтому структура фиксированная
 type DomainPayload struct {
     PrimaryDomain  string    `json:"primary_domain"`
     RedirectTarget string    `json:"redirect_target"`
     Version        int64     `json:"version"`
     UpdatedAt      time.Time `json:"updated_at"`
 }
-
+// toMap конвертирует payload в map для передачи в KeyRinger.Sign()
+// нужно потому что Sign принимает map а не структуру
+// это позволяет подписывать любые данные  не только DomainPayload
 func (p DomainPayload) toMap() map[string]interface{} {
     return map[string]interface{}{
         "primary_domain":  p.PrimaryDomain,
@@ -54,7 +67,9 @@ func (p DomainPayload) toMap() map[string]interface{} {
         "updated_at":      p.UpdatedAt,
     }
 }
-
+// Server основная структура сервиса  хранит все зависимости
+// router пересобирается при вызове WithRateLimiter
+// rateLimiter nil по умолчанию  в этом случае используется встроенный
 type Server struct {
     cfg         *APIConfig
     store       Storage
@@ -64,6 +79,11 @@ type Server struct {
     router      *gin.Engine
     rateLimiter gin.HandlerFunc 
 }
+
+
+// New создаёт сервер и проверяет все зависимости
+// падает сразу если что то nil или токен слишком короткий
+// лучше упасть здесь чем получить панику во время запроса
 func New(
     cfg *APIConfig,
     store Storage,
@@ -103,16 +123,24 @@ func New(
     return s, nil
 }
 
+// WithRateLimiter подменяет встроенный rate limiter на внешний
+// используется в тестах чтобы покрыть ветку if s.rateLimiter != nil
+// в production не используется
+
 func (s *Server) WithRateLimiter(h gin.HandlerFunc) {
     s.rateLimiter = h
     s.router = s.buildRouter()
 }
 
-
+// ServeHTTP реализует интерфейс http.Handler
+// позволяет передавать Server напрямую в http.Server без обёрток
+// так же используется в тестах через httptest.NewRecorder()
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     s.router.ServeHTTP(w, r)
 }
-
+// buildRouter собирает все маршруты и middleware
+// порядок middleware важен  recovery должен быть первым
+// rateLimiter после cors  чтобы preflight запросы не считались в лимите
 func (s *Server) buildRouter() *gin.Engine {
     r := gin.New()
     r.Use(gin.Recovery())
@@ -140,7 +168,9 @@ func (s *Server) buildRouter() *gin.Engine {
 
     return r
 }
-
+// rateLimitWithInstance middleware для ограничения запросов по ip
+// если хранилище лимитера недоступно  пропускаем запрос
+// лучше пропустить лишний запрос чем блокировать всех из за ошибки
 func (s *Server) rateLimitWithInstance(instance *limiter.Limiter) gin.HandlerFunc {
     return func(c *gin.Context) {
         ctx, err := instance.Get(c.Request.Context(), c.ClientIP())
@@ -155,7 +185,8 @@ func (s *Server) rateLimitWithInstance(instance *limiter.Limiter) gin.HandlerFun
         c.Next()
     }
 }
-
+// structuredLogger пишет каждый запрос в лог после его завершения
+// время замеряется до c.Next()  чтобы включить всё время обработки
 func (s *Server) structuredLogger() gin.HandlerFunc {
     return func(c *gin.Context) {
         start := time.Now()
@@ -169,7 +200,9 @@ func (s *Server) structuredLogger() gin.HandlerFunc {
         )
     }
 }
-
+// bearerAuth проверяет токен из заголовка Authorization
+// 401 если заголовок отсутствует  403 если токен неверный
+// разделение намеренное  401 означает не аутентифицирован  403 означает нет доступа
 func (s *Server) bearerAuth() gin.HandlerFunc {
     return func(c *gin.Context) {
         header := c.GetHeader("Authorization")
@@ -185,11 +218,15 @@ func (s *Server) bearerAuth() gin.HandlerFunc {
         c.Next()
     }
 }
-
+// withTimeout создаёт контекст с таймаутом из контекста gin запроса
+// вынесен в хелпер чтобы не повторять одну и ту же строку в каждом хендлере
+// cancel нужно вызывать через defer сразу после вызова этой функции
 func withTimeout(c *gin.Context, d time.Duration) (context.Context, context.CancelFunc) {
     return context.WithTimeout(c.Request.Context(), d)
 }
-
+// handleHealth проверяет доступность redis
+// используется как liveness probe в kubernetes
+// если redis недоступен  возвращает 503 чтобы балансировщик убрал инстанс
 func (s *Server) handleHealth(c *gin.Context) {
     ctx, cancel := withTimeout(c, healthTimeout)
     defer cancel()
@@ -203,7 +240,9 @@ func (s *Server) handleHealth(c *gin.Context) {
     }
     c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
-
+// handleAgentCheckin основной эндпоинт  агент получает подписанный конфиг
+// если конфига в redis нет  создаёт дефолтный из конфига сервера
+// agent_id необязательный  если не передан  генерируется uuid
 func (s *Server) handleAgentCheckin(c *gin.Context) {
     const endpoint = "checkin"
     s.metrics.requestsTotal.WithLabelValues(endpoint).Inc()
@@ -251,7 +290,9 @@ type updateDomainRequest struct {
     PrimaryDomain  string `json:"primary_domain"  binding:"required"`
     RedirectTarget string `json:"redirect_target" binding:"required"`
 }
-
+// handleAdminUpdateDomain обновляет домен и редирект
+// валидирует домен по rfc  схему редиректа  пустые поля
+// возвращает новую версию конфига  агенты узнают об изменении на следующем checkin
 func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
     const endpoint = "update_domain"
     s.metrics.requestsTotal.WithLabelValues(endpoint).Inc()
@@ -294,7 +335,9 @@ func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
 type rotateKeyRequest struct {
     NewSecret string `json:"new_secret" binding:"required"`
 }
-
+// handleAdminRotateKey заменяет текущий hmac ключ новым
+// старый ключ остаётся валидным ещё 1 час  см crypto.go
+// минимальная длина нового секрета 32 символа  проверяется здесь и в keyring
 func (s *Server) handleAdminRotateKey(c *gin.Context) {
     var req rotateKeyRequest
     if err := c.ShouldBindJSON(&req); err != nil {
@@ -314,14 +357,18 @@ func (s *Server) handleAdminRotateKey(c *gin.Context) {
     s.log.Info("HMAC key rotated", slog.Int("key_id", s.keyRing.CurrentID()))
     c.JSON(http.StatusOK, gin.H{"status": "ok", "key_id": s.keyRing.CurrentID()})
 }
-
+// createDefaultDomain создаёт первоначальный конфиг при старте сервиса
+// вызывается только когда в redis ещё нет записи  то есть первый запуск
+// значения берутся из конфига сервера  DEFAULT_DOMAIN и DEFAULT_REDIRECT
 func (s *Server) createDefaultDomain(ctx context.Context) (*DomainConfig, error) {
     return s.store.UpdateDomain(ctx, &DomainConfig{
         PrimaryDomain:  s.cfg.DefaultDomain,
         RedirectTarget: s.cfg.DefaultRedirect,
     })
 }
-
+// newDomainPayload конвертирует DomainConfig из storage в DomainPayload для ответа
+// разделение намеренное  DomainConfig это внутренняя структура хранилища
+// DomainPayload это то что уходит агенту по сети  менять одно не должно ломать другое
 func newDomainPayload(d *DomainConfig) DomainPayload {
     return DomainPayload{
         PrimaryDomain:  d.PrimaryDomain,
@@ -330,7 +377,9 @@ func newDomainPayload(d *DomainConfig) DomainPayload {
         UpdatedAt:      d.UpdatedAt,
     }
 }
-
+// validateDomain проверяет доменное имя по правилам rfc 1035
+// поддерживает wildcard домены вида *.example.com
+// каждый лейбл проверяется отдельно  длина  символы  дефисы по краям
 func validateDomain(domain string) error {
     if domain == "" {
         return errors.New("primary_domain must not be empty")
@@ -359,7 +408,9 @@ func validateDomain(domain string) error {
     }
     return nil
 }
-
+// isValidLabel проверяет один сегмент доменного имени
+// допустимы только буквы  цифры и дефис
+// дефис не может быть первым или последним символом
 func isValidLabel(s string) bool {
     for _, r := range s {
         if !((r >= 'a' && r <= 'z') ||
@@ -371,7 +422,8 @@ func isValidLabel(s string) bool {
     }
     return s[0] != '-' && s[len(s)-1] != '-'
 }
-
+// validateRedirectURL проверяет что редирект это валидный http или https url
+// ftp  mailto и прочие схемы не принимаются
 func validateRedirectURL(raw string) error {
     if raw == "" {
         return errors.New("redirect_target must not be empty")
