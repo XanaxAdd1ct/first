@@ -72,6 +72,7 @@ type Config struct {
     LogLevel string `envconfig:"LOG_LEVEL" default:"info"`
     TLSCertFile     string `envconfig:"TLS_CERT_FILE"`  
     TLSKeyFile      string `envconfig:"TLS_KEY_FILE"`
+     AdminAllowedIPs []string `envconfig:"ADMIN_ALLOWED_IPS"`
 }
 
 
