@@ -1,12 +1,8 @@
-// точка входа  намеренно тонкая  только сборка зависимостей и запуск
-//
-// вся логика в run() а не в main()  это позволяет тестировать
-// запуск без os.Exit и даёт нормальные коды возврата
-
 package main
 
 import (
     "context"
+    "crypto/tls"
     "errors"
     "fmt"
     "log/slog"
@@ -19,18 +15,7 @@ import (
     "github.com/prometheus/client_golang/prometheus"
 )
 
-// shutdownTimeout сколько ждём завершения in-flight запросов при shutdown
-//
-// 10 секунд выбраны с запасом  handlerTimeout в api.go тоже 10 секунд
-// значит самый долгий запрос успеет завершиться до того как мы отрубим сервер
-
 const shutdownTimeout = 10 * time.Second
-
-// main читает конфиг и запускает сервис
-//
-// при любой ошибке инициализации  os.Exit(1)
-// это намеренно  если не можем стартовать  лучше упасть быстро
-// чем висеть в невалидном состоянии  оркестратор поднимет заново
 
 func main() {
     cfg, err := Load()
@@ -46,13 +31,6 @@ func main() {
         os.Exit(1)
     }
 }
-
-// run собирает все зависимости и запускает http сервер
-//
-// порядок инициализации важен  storage  keyring  server  http
-// каждый следующий зависит от предыдущего
-// defer store.Close() гарантирует закрытие соединения с Redis
-// даже если что то упало при инициализации дальше по цепочке
 
 func run(cfg *Config, log *slog.Logger) error {
     store, err := NewStorage(cfg.RedisURL, cfg.RedisTTLDuration())
@@ -85,37 +63,76 @@ func run(cfg *Config, log *slog.Logger) error {
         return fmt.Errorf("init server: %w", err)
     }
 
-    httpSrv := &http.Server{
+    httpSrv := buildHTTPServer(cfg, srv)
+
+    return serveWithGracefulShutdown(httpSrv, cfg, log)
+}
+
+// buildHTTPServer собирает http.Server с правильными таймаутами и TLS
+//
+// таймауты выставлены консервативно:
+//   - ReadHeaderTimeout 5s  защита от slowloris
+//   - ReadTimeout 15s  максимум на чтение тела запроса
+//   - WriteTimeout 15s  максимум на отправку ответа
+//   - IdleTimeout 30s  keep-alive соединения
+//   - MaxHeaderBytes 64kb  защита от огромных заголовков
+//
+// TLS включается только если заданы оба пути к сертификату и ключу
+// MinVersion TLS 1.3  запрещает устаревшие уязвимые версии
+func buildHTTPServer(cfg *Config, handler http.Handler) *http.Server {
+    srv := &http.Server{
         Addr:              cfg.ListenAddr(),
-        Handler:           srv,
-        ReadHeaderTimeout: 10 * time.Second,
-        ReadTimeout:       30 * time.Second,
-        WriteTimeout:      30 * time.Second,
-        IdleTimeout:       60 * time.Second,
+        Handler:           handler,
+        ReadHeaderTimeout: 5 * time.Second,
+        ReadTimeout:       15 * time.Second,
+        WriteTimeout:      15 * time.Second,
+        IdleTimeout:       30 * time.Second,
+        MaxHeaderBytes:    1 << 16,
     }
 
-    return serveWithGracefulShutdown(httpSrv, log)
+    if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+        srv.TLSConfig = &tls.Config{
+            MinVersion:               tls.VersionTLS13,
+            PreferServerCipherSuites: true,
+            CurvePreferences: []tls.CurveID{
+                tls.X25519,
+                tls.CurveP256,
+            },
+            CipherSuites: []uint16{
+                tls.TLS_AES_128_GCM_SHA256,
+                tls.TLS_AES_256_GCM_SHA384,
+                tls.TLS_CHACHA20_POLY1305_SHA256,
+            },
+        }
+    }
+
+    return srv
 }
 
 // serveWithGracefulShutdown запускает сервер и обрабатывает SIGINT/SIGTERM
 //
-// два канала  serverErr ошибка ListenAndServe и quit сигнал ОС
-// select блокируется на обоих  первый победивший определяет что делать
-//
-// http.ErrServerClosed это не ошибка  штатное завершение после Shutdown()
-// всё остальное реальная проблема  порт занят  нет прав и тд
-//
-// после сигнала даём сервису shutdownTimeout на завершение текущих запросов
-// по истечению таймаута http.Server.Shutdown вернёт context.DeadlineExceeded
-// мы пробрасываем это как ошибку и выходим с кодом 1
-
-func serveWithGracefulShutdown(srv *http.Server, log *slog.Logger) error {
+// если заданы TLS сертификаты  запускает HTTPS  иначе HTTP
+// http.ErrServerClosed не ошибка  штатное завершение после Shutdown()
+// после сигнала даём shutdownTimeout на завершение текущих запросов
+func serveWithGracefulShutdown(srv *http.Server, cfg *Config, log *slog.Logger) error {
     serverErr := make(chan error, 1)
 
     go func() {
-        log.Info("server starting", slog.String("addr", srv.Addr))
-        if err := srv.ListenAndServe(); errors.Is(err, http.ErrServerClosed) {
-            serverErr <- nil // внешний Shutdown — штатное завершение
+        log.Info("server starting",
+            slog.String("addr", srv.Addr),
+            slog.Bool("tls", cfg.TLSCertFile != ""),
+        )
+
+        var err error
+        if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+            err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+        } else {
+            log.Warn("TLS not configured  running without HTTPS")
+            err = srv.ListenAndServe()
+        }
+
+        if errors.Is(err, http.ErrServerClosed) {
+            serverErr <- nil
         } else {
             serverErr <- fmt.Errorf("listen and serve: %w", err)
         }
