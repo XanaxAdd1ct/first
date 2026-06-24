@@ -37,11 +37,7 @@ func run(cfg *Config, log *slog.Logger) error {
     if err != nil {
         return fmt.Errorf("init storage: %w", err)
     }
-    defer func() {
-        if err := store.Close(); err != nil {
-            log.Warn("storage close error", "err", err)
-        }
-    }()
+    defer store.Close()
 
     nonces := newNonceStore()
     defer nonces.shutdown()
@@ -52,20 +48,26 @@ func run(cfg *Config, log *slog.Logger) error {
     }
 
     srv, err := New(
-    &APIConfig{...},
-    store,
-    keyRing,
-    nonces,
-    log,
-    prometheus.DefaultRegisterer,
-    SecurityConfig{
-        TelegramToken:  os.Getenv("TELEGRAM_TOKEN"), 
-        TelegramChatID: os.Getenv("TELEGRAM_CHAT_ID"),
-    },
-)
+        &APIConfig{
+            AdminToken:      cfg.AdminToken.Value(),
+            DefaultDomain:   cfg.DefaultDomain,
+            DefaultRedirect: cfg.DefaultRedirect,
+            AdminAllowedIPs: cfg.AdminAllowedIPs,
+        },
+        store,
+        keyRing,
+        nonces,
+        log,
+        prometheus.DefaultRegisterer,
+        SecurityConfig{
+            TelegramToken:  cfg.TelegramToken,
+            TelegramChatID: cfg.TelegramChatID,
+        },
+    )
     if err != nil {
         return fmt.Errorf("init server: %w", err)
     }
+    defer srv.Close()
 
     httpSrv := buildHTTPServer(cfg, srv)
 
