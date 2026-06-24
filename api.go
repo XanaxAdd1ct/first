@@ -33,36 +33,6 @@ const (
     cleanupTick     = 1 * time.Minute
 )
 
-type KeyRinger interface {
-    Sign(payload map[string]interface{}) (signature string, keyID int, err error)
-    Verify(payload map[string]interface{}, signature string, keyID int) error
-    Rotate(newSecret string) error
-    CurrentID() int
-}
-
-type APIConfig struct {
-    AdminToken      string
-    DefaultDomain   string
-    DefaultRedirect string
-    AdminAllowedIPs []string
-}
-
-type DomainPayload struct {
-    PrimaryDomain  string    `json:"primary_domain"`
-    RedirectTarget string    `json:"redirect_target"`
-    Version        int64     `json:"version"`
-    UpdatedAt      time.Time `json:"updated_at"`
-}
-
-func (p DomainPayload) toMap() map[string]interface{} {
-    return map[string]interface{}{
-        "primary_domain":  p.PrimaryDomain,
-        "redirect_target": p.RedirectTarget,
-        "version":         p.Version,
-        "updated_at":      p.UpdatedAt,
-    }
-}
-
 type Server struct {
     cfg             *APIConfig
     store           Storage
@@ -109,9 +79,9 @@ func New(
     return s, nil
 }
 
-func (s *Server) WithRateLimiter(h gin.HandlerFunc) {
-    s.rateLimiter = h
-    s.router = s.buildRouter()
+func (s *Server) Close() {
+    s.nonces.shutdown()
+    s.securityMonitor.Shutdown()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +89,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) buildRouter() *gin.Engine {
+    gin.SetMode(gin.ReleaseMode)
     r := gin.New()
     r.Use(gin.Recovery())
     r.Use(s.structuredLogger())
@@ -126,30 +97,43 @@ func (s *Server) buildRouter() *gin.Engine {
     r.Use(s.bodyLimit())
     r.Use(SecurityMiddleware(s.securityMonitor))
 
-    if s.rateLimiter != nil {
-        r.Use(s.rateLimiter)
-    } else {
-        rate := limiter.Rate{Period: rateLimitPeriod, Limit: rateLimitCount}
-        store := memory.NewStore()
-        r.Use(s.rateLimitWithInstance(limiter.New(store, rate)))
-    }
+    rate := limiter.Rate{Period: rateLimitPeriod, Limit: rateLimitCount}
+    store := memory.NewStore()
+    r.Use(s.rateLimitWithInstance(limiter.New(store, rate)))
 
     r.GET("/metrics", gin.WrapH(promhttp.Handler()))
     r.GET("/health", s.handleHealth)
 
     agent := r.Group("/api/v1/agent")
-    agent.POST("/checkin", s.handleAgentCheckin)
+    {
+        agent.POST("/checkin", s.handleAgentCheckin)
+    }
 
     wl := NewIPWhitelist(s.cfg.AdminAllowedIPs, s.log)
-
     admin := r.Group("/api/v1/admin")
-    admin.Use(wl.Middleware())
-    admin.Use(s.bearerAuth())
-    admin.Use(nonceMiddleware(s.nonces))
-    admin.POST("/update_domain", s.handleAdminUpdateDomain)
-    admin.POST("/rotate_key", s.handleAdminRotateKey)
+    {
+        admin.Use(wl.Middleware())
+        admin.Use(s.bearerAuth())
+        admin.Use(nonceMiddleware(s.nonces))
+        admin.POST("/update_domain", s.handleAdminUpdateDomain)
+        admin.POST("/rotate_key", s.handleAdminRotateKey)
+    }
 
     return r
+}
+
+func (s *Server) structuredLogger() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        start := time.Now()
+        c.Next()
+        s.log.Info("request",
+            slog.String("method", c.Request.Method),
+            slog.String("path", c.Request.URL.Path),
+            slog.Int("status", c.Writer.Status()),
+            slog.Duration("duration", time.Since(start)),
+            slog.String("ip", c.ClientIP()),
+        )
+    }
 }
 
 func (s *Server) bodyLimit() gin.HandlerFunc {
@@ -167,24 +151,10 @@ func (s *Server) rateLimitWithInstance(instance *limiter.Limiter) gin.HandlerFun
             return
         }
         if ctx.Reached {
-            c.AbortWithStatusJSON(http.StatusTooManyRequests, errorResponse("rate limit exceeded"))
+            c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
             return
         }
         c.Next()
-    }
-}
-
-func (s *Server) structuredLogger() gin.HandlerFunc {
-    return func(c *gin.Context) {
-        start := time.Now()
-        c.Next()
-        s.log.Info("request",
-            slog.String("method", c.Request.Method),
-            slog.String("path", c.Request.URL.Path),
-            slog.Int("status", c.Writer.Status()),
-            slog.Duration("duration", time.Since(start)),
-            slog.String("ip", c.ClientIP()),
-        )
     }
 }
 
@@ -193,11 +163,11 @@ func (s *Server) bearerAuth() gin.HandlerFunc {
         header := c.GetHeader("Authorization")
         token, ok := strings.CutPrefix(header, "Bearer ")
         if !ok || token == "" {
-            c.AbortWithStatusJSON(http.StatusUnauthorized, errorResponse("missing Bearer token"))
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
             return
         }
         if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) != 1 {
-            c.AbortWithStatusJSON(http.StatusForbidden, errorResponse("invalid token"))
+            c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid token"})
             return
         }
         c.Next()
@@ -207,48 +177,29 @@ func (s *Server) bearerAuth() gin.HandlerFunc {
 func (s *Server) handleHealth(c *gin.Context) {
     ctx, cancel := context.WithTimeout(c.Request.Context(), healthTimeout)
     defer cancel()
-
     if err := s.store.Ping(ctx); err != nil {
-        s.log.Warn("health check: redis unavailable", slog.String("err", err.Error()))
-        c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": err.Error()})
+        c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy"})
         return
     }
     c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (s *Server) handleAgentCheckin(c *gin.Context) {
-    const endpoint = "checkin"
-    s.metrics.requestsTotal.WithLabelValues(endpoint).Inc()
-
     agentID := c.Query("agent_id")
     if agentID == "" {
         agentID = uuid.New().String()
     }
-
     ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
     defer cancel()
 
     domain, err := s.store.GetDomain(ctx)
-    if errors.Is(err, ErrNotFound) {
-        domain, err = s.createDefaultDomain(ctx)
-    }
     if err != nil {
-        s.log.Error("checkin: get domain failed", slog.String("err", err.Error()))
-        s.metrics.errorsTotal.WithLabelValues(endpoint, "500").Inc()
-        c.JSON(http.StatusInternalServerError, errorResponse("storage error"))
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "storage error"})
         return
     }
 
     payload := newDomainPayload(domain)
-    sig, keyID, err := s.keyRing.Sign(payload.toMap())
-    if err != nil {
-        s.log.Error("checkin: sign failed", slog.String("err", err.Error()))
-        s.metrics.errorsTotal.WithLabelValues(endpoint, "500").Inc()
-        c.JSON(http.StatusInternalServerError, errorResponse("signing error"))
-        return
-    }
-
-    s.metrics.domainVersion.WithLabelValues(domain.PrimaryDomain).Set(float64(domain.Version))
+    sig, keyID, _ := s.keyRing.Sign(payload.toMap())
 
     c.JSON(http.StatusOK, gin.H{
         "action":      "update_domain",
@@ -259,29 +210,15 @@ func (s *Server) handleAgentCheckin(c *gin.Context) {
     })
 }
 
-type updateDomainRequest struct {
-    PrimaryDomain  string `json:"primary_domain"  binding:"required"`
-    RedirectTarget string `json:"redirect_target" binding:"required"`
-}
-
 func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
-    const endpoint = "update_domain"
-    s.metrics.requestsTotal.WithLabelValues(endpoint).Inc()
-
-    var req updateDomainRequest
+    var req struct {
+        PrimaryDomain  string `json:"primary_domain" binding:"required"`
+        RedirectTarget string `json:"redirect_target" binding:"required"`
+    }
     if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, errorResponse(err.Error()))
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
     }
-    if err := validateDomain(req.PrimaryDomain); err != nil {
-        c.JSON(http.StatusBadRequest, errorResponse(err.Error()))
-        return
-    }
-    if err := validateRedirectURL(req.RedirectTarget); err != nil {
-        c.JSON(http.StatusBadRequest, errorResponse(err.Error()))
-        return
-    }
-
     ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
     defer cancel()
 
@@ -290,13 +227,9 @@ func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
         RedirectTarget: req.RedirectTarget,
     })
     if err != nil {
-        s.log.Error("admin: update domain failed", slog.String("err", err.Error()))
-        s.metrics.errorsTotal.WithLabelValues(endpoint, "500").Inc()
-        c.JSON(http.StatusInternalServerError, errorResponse("storage error"))
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "storage error"})
         return
     }
-
-    s.log.Info("domain updated by admin", slog.String("domain", updated.PrimaryDomain), slog.Int64("version", updated.Version))
     c.JSON(http.StatusOK, gin.H{"status": "ok", "version": updated.Version})
 }
 
@@ -305,21 +238,14 @@ func (s *Server) handleAdminRotateKey(c *gin.Context) {
         NewSecret string `json:"new_secret" binding:"required"`
     }
     if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, errorResponse(err.Error()))
-        return
-    }
-    if len(req.NewSecret) < minTokenLen {
-        c.JSON(http.StatusBadRequest, errorResponse("new_secret too short"))
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
     }
     if err := s.keyRing.Rotate(req.NewSecret); err != nil {
-        s.log.Error("admin: rotate key failed", slog.String("err", err.Error()))
-        c.JSON(http.StatusInternalServerError, errorResponse("key rotation failed"))
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "rotation failed"})
         return
     }
-
-    s.log.Info("HMAC key rotated", slog.Int("key_id", s.keyRing.CurrentID()))
-    c.JSON(http.StatusOK, gin.H{"status": "ok", "key_id": s.keyRing.CurrentID()})
+    c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (s *Server) createDefaultDomain(ctx context.Context) (*DomainConfig, error) {
@@ -336,53 +262,6 @@ func newDomainPayload(d *DomainConfig) DomainPayload {
         Version:        d.Version,
         UpdatedAt:      d.UpdatedAt,
     }
-}
-
-func validateDomain(domain string) error {
-    if domain == "" {
-        return errors.New("primary_domain must not be empty")
-    }
-    check := strings.TrimPrefix(domain, "*.")
-    if check == "" {
-        return errors.New("primary_domain: invalid format")
-    }
-    if strings.ContainsAny(check, " \t\n/\\@#?") {
-        return errors.New("primary_domain: invalid characters")
-    }
-    parts := strings.Split(check, ".")
-    if len(parts) < 2 {
-        return errors.New("primary_domain: must contain at least one dot")
-    }
-    for _, part := range parts {
-        if part == "" || len(part) > 63 || !isValidLabel(part) {
-            return errors.New("primary_domain: invalid label")
-        }
-    }
-    return nil
-}
-
-func isValidLabel(s string) bool {
-    for _, r := range s {
-        if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
-            return false
-        }
-    }
-    return s[0] != '-' && s[len(s)-1] != '-'
-}
-
-func validateRedirectURL(raw string) error {
-    if raw == "" {
-        return errors.New("redirect_target must not be empty")
-    }
-    u, err := url.ParseRequestURI(raw)
-    if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-        return errors.New("redirect_target: invalid URL")
-    }
-    return nil
-}
-
-func errorResponse(msg string) gin.H {
-    return gin.H{"error": msg}
 }
 
 type nonceStore struct {
@@ -403,9 +282,7 @@ func newNonceStore() *nonceStore {
     return ns
 }
 
-func (ns *nonceStore) shutdown() {
-    ns.cancel()
-}
+func (ns *nonceStore) shutdown() { ns.cancel() }
 
 func (ns *nonceStore) cleanup() {
     ticker := time.NewTicker(cleanupTick)
@@ -417,9 +294,9 @@ func (ns *nonceStore) cleanup() {
         case <-ticker.C:
             now := time.Now()
             ns.mu.Lock()
-            for nonce, ts := range ns.data {
+            for n, ts := range ns.data {
                 if now.Sub(ts) > nonceTTL {
-                    delete(ns.data, nonce)
+                    delete(ns.data, n)
                 }
             }
             ns.mu.Unlock()
@@ -427,50 +304,20 @@ func (ns *nonceStore) cleanup() {
     }
 }
 
-func isValidNonceFormat(nonce string) bool {
-    if len(nonce) != 32 {
-        return false
-    }
-    for _, r := range nonce {
-        if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-            return false
-        }
-    }
-    return true
-}
-
 func nonceMiddleware(ns *nonceStore) gin.HandlerFunc {
     return func(c *gin.Context) {
         nonce := c.GetHeader(nonceHeader)
-        if !isValidNonceFormat(nonce) {
-            c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid or missing X-Nonce"})
+        if len(nonce) != 32 {
+            c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid nonce"})
             return
         }
-
-        ns.mu.RLock()
-        _, exists := ns.data[nonce]
-        ns.mu.RUnlock()
-
-        if exists {
-            c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "nonce already used"})
-            return
-        }
-
         ns.mu.Lock()
-        if len(ns.data) >= nonceMaxStore {
-            ns.mu.Unlock()
-            c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "nonce storage full"})
-            return
-        }
-
+        defer ns.mu.Unlock()
         if _, exists := ns.data[nonce]; exists {
-            ns.mu.Unlock()
-            c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "nonce already used"})
+            c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "nonce used"})
             return
         }
-
         ns.data[nonce] = time.Now()
-        ns.mu.Unlock()
         c.Next()
     }
 }
