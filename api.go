@@ -67,6 +67,7 @@ type Server struct {
     router          *gin.Engine
     rateLimiter     gin.HandlerFunc
     securityMonitor *SecurityMonitor
+    nonces          *nonceStore
 }
 
 func New(
@@ -98,13 +99,14 @@ func New(
     }
 
     s := &Server{
-        cfg:             cfg,
-        store:           store,
-        keyRing:         keyRing,
-        log:             log,
-        metrics:         m,
-        securityMonitor: NewSecurityMonitor(log, SecurityConfig{}),
-    }
+    cfg:             cfg,
+    store:           store,
+    keyRing:         keyRing,
+    log:             log,
+    metrics:         m,
+    securityMonitor: NewSecurityMonitor(log, SecurityConfig{}),
+    nonces:          newNonceStore(),
+}
     s.router = s.buildRouter()
     return s, nil
 }
@@ -143,10 +145,11 @@ func (s *Server) buildRouter() *gin.Engine {
     wl := NewIPWhitelist(s.cfg.AdminAllowedIPs, s.log)
 
     admin := r.Group("/api/v1/admin")
-    admin.Use(wl.Middleware())
-    admin.Use(s.bearerAuth())
-    admin.POST("/update_domain", s.handleAdminUpdateDomain)
-    admin.POST("/rotate_key", s.handleAdminRotateKey)
+admin.Use(wl.Middleware())
+admin.Use(s.bearerAuth())
+admin.Use(nonceMiddleware(s.nonces))
+admin.POST("/update_domain", s.handleAdminUpdateDomain)
+admin.POST("/rotate_key", s.handleAdminRotateKey)
 
     return r
 }
