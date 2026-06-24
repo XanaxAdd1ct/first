@@ -1,10 +1,3 @@
-// мониторинг подозрительной активности и защита от атак
-//
-// следит за брутфорсом и ddos  не блокирует запросы сам
-// блокировку делает rate limiter  монитор собирает доказательства
-// при накоплении 1000 событий с одного ip  упаковывает их в zip
-// и отправляет в телеграм или сохраняет локально
-
 package main
 
 import (
@@ -20,6 +13,7 @@ import (
     "os"
     "path/filepath"
     "sync"
+    "sync/atomic"
     "time"
 
     "github.com/gin-gonic/gin"
@@ -34,36 +28,27 @@ const (
     cleanupInterval     = time.Minute
     ipRetentionDuration = time.Hour
     ddosLogCooldown     = 5 * time.Second
+    archiveWorkers      = 4
+    archiveQueueSize    = 256
+    sendTimeout         = 30 * time.Second
 )
-// suspiciousEvent одно подозрительное событие с временной меткой
-// kind может быть auth_failure или rate_limit
-// сериализуется в json при архивировании
+
 type suspiciousEvent struct {
     At   time.Time `json:"at"`
     Kind string    `json:"kind"`
 }
-// ipRecord хранит историю событий с одного ip в кольцевом буфере
-//
-// кольцевой буфер выбран намеренно  фиксированный размер памяти
-// при переполнении старые события затираются новыми автоматически
-// свой мьютекс у каждой записи  чтобы не блокировать весь монитор
-// пока идёт архивирование одного ip
-//
-// suspicious не удаляется автоматически  только вручную через ClearSuspicious
-// это важно  злоумышленник должен оставаться в списке пока его не проверили
+
 type ipRecord struct {
     mu          sync.Mutex
     events      [maxEventsPerIP]suspiciousEvent
-    count       int  // сколько всего записано  максимум maxEventsPerIP
-    head        int  // индекс самого старого события
+    count       int
+    head        int
     total       uint64
-    suspicious  bool
-    lastDDOSLog time.Time
+    suspicious  int32
+    lastDDOSLog int64
+    flushLock   int32
 }
 
-// add добавляет событие в кольцевой буфер
-// когда буфер заполнен  перезаписывает самое старое событие
-// возвращает количество событий данного kind за указанное окно
 func (r *ipRecord) add(now time.Time, kind string, window time.Duration) int {
     r.mu.Lock()
     defer r.mu.Unlock()
@@ -74,7 +59,6 @@ func (r *ipRecord) add(now time.Time, kind string, window time.Duration) int {
     if r.count < maxEventsPerIP {
         r.count++
     } else {
-         
         r.head = (r.head + 1) % maxEventsPerIP
     }
     r.total++
@@ -82,28 +66,14 @@ func (r *ipRecord) add(now time.Time, kind string, window time.Duration) int {
     cutoff := now.Add(-window)
     n := 0
     for i := 0; i < r.count; i++ {
-        idx := (r.head + i) % maxEventsPerIP
-        e := r.events[idx]
-        if e.At.Before(cutoff) {
-            continue
-        }
-        if e.Kind == kind {
+        e := r.events[(r.head+i)%maxEventsPerIP]
+        if !e.At.Before(cutoff) && e.Kind == kind {
             n++
         }
     }
     return n
 }
 
-// add добавляет событие в кольцевой буфер и считает похожие события за окно
-//
-// алгоритм:
-//   1. вычисляем позицию tail = (head + count) % maxEventsPerIP
-//   2. записываем событие на позицию tail
-//   3. если буфер полон  двигаем head вперёд  затирая старейшее событие
-//   4. обходим все count элементов начиная с head  считаем нужный kind за окно
-//
-// обходим все элементы без break  потому что ring buffer не гарантирует
-// хронологический порядок после переполнения
 func (r *ipRecord) snapshot() []suspiciousEvent {
     out := make([]suspiciousEvent, r.count)
     for i := 0; i < r.count; i++ {
@@ -112,16 +82,39 @@ func (r *ipRecord) snapshot() []suspiciousEvent {
     return out
 }
 
-// isFull возвращает true если буфер заполнен
-func (r *ipRecord) isFull() bool {
-    r.mu.Lock()
-    defer r.mu.Unlock()
-    return r.count == maxEventsPerIP
+func (r *ipRecord) isSuspicious() bool {
+    return atomic.LoadInt32(&r.suspicious) == 1
 }
 
-// SecurityConfig конфигурация монитора
-// TelegramToken и TelegramChatID опциональны
-// если не заданы  архив сохраняется локально в ArchiveDir
+func (r *ipRecord) markSuspicious() {
+    atomic.StoreInt32(&r.suspicious, 1)
+}
+
+func (r *ipRecord) clearSuspicious() {
+    atomic.StoreInt32(&r.suspicious, 0)
+}
+
+func (r *ipRecord) tryLockFlush() bool {
+    return atomic.CompareAndSwapInt32(&r.flushLock, 0, 1)
+}
+
+func (r *ipRecord) unlockFlush() {
+    atomic.StoreInt32(&r.flushLock, 0)
+}
+
+func (r *ipRecord) shouldLogDDOS(now time.Time) bool {
+    last := atomic.LoadInt64(&r.lastDDOSLog)
+    if now.UnixNano()-last < int64(ddosLogCooldown) {
+        return false
+    }
+    return atomic.CompareAndSwapInt64(&r.lastDDOSLog, last, now.UnixNano())
+}
+
+type archiveTask struct {
+    ip     string
+    events []suspiciousEvent
+}
+
 type SecurityConfig struct {
     TelegramToken  string
     TelegramChatID string
@@ -129,18 +122,21 @@ type SecurityConfig struct {
 }
 
 type SecurityMonitor struct {
-    mu      sync.Mutex
-    records map[string]*ipRecord
-    log     *slog.Logger
-    cfg     SecurityConfig
-    ctx     context.Context
-    cancel  context.CancelFunc
+    mu       sync.RWMutex
+    records  map[string]*ipRecord
+    log      *slog.Logger
+    cfg      SecurityConfig
+    ctx      context.Context
+    cancel   context.CancelFunc
+    queue    chan archiveTask
+    wg       sync.WaitGroup
 }
 
 func NewSecurityMonitor(log *slog.Logger, cfg SecurityConfig) *SecurityMonitor {
     if cfg.ArchiveDir == "" {
         cfg.ArchiveDir = "security_archives"
     }
+
     ctx, cancel := context.WithCancel(context.Background())
     m := &SecurityMonitor{
         records: make(map[string]*ipRecord),
@@ -148,110 +144,186 @@ func NewSecurityMonitor(log *slog.Logger, cfg SecurityConfig) *SecurityMonitor {
         cfg:     cfg,
         ctx:     ctx,
         cancel:  cancel,
+        queue:   make(chan archiveTask, archiveQueueSize),
     }
+
+    for i := 0; i < archiveWorkers; i++ {
+        m.wg.Add(1)
+        go m.archiveWorker()
+    }
+
+    m.wg.Add(1)
     go m.cleanup()
+
     return m
 }
 
 func (m *SecurityMonitor) Shutdown() {
     m.cancel()
+    m.wg.Wait()
 }
 
-// getOrCreate возвращает запись для ip  создаёт если нет
 func (m *SecurityMonitor) getOrCreate(ip string) *ipRecord {
+    m.mu.RLock()
+    rec, ok := m.records[ip]
+    m.mu.RUnlock()
+    if ok {
+        return rec
+    }
+
     m.mu.Lock()
     defer m.mu.Unlock()
-    rec, ok := m.records[ip]
-    if !ok {
-        rec = &ipRecord{}
-        m.records[ip] = rec
+    if rec, ok = m.records[ip]; ok {
+        return rec
     }
+    rec = &ipRecord{}
+    m.records[ip] = rec
     return rec
 }
 
-// cleanup удаляет старые обычные записи
-// подозрительные не трогает никогда
 func (m *SecurityMonitor) cleanup() {
+    defer m.wg.Done()
     ticker := time.NewTicker(cleanupInterval)
     defer ticker.Stop()
+
     for {
         select {
         case <-ticker.C:
-            m.mu.Lock()
-            cutoff := time.Now().Add(-ipRetentionDuration)
-            for ip, rec := range m.records {
-                rec.mu.Lock()
-                if rec.suspicious {
-                    rec.mu.Unlock()
-                    continue
-                }
-                hasRecent := false
-                for i := 0; i < rec.count; i++ {
-                    if rec.events[(rec.head+i)%maxEventsPerIP].At.After(cutoff) {
-                        hasRecent = true
-                        break
-                    }
-                }
-                rec.mu.Unlock()
-                if !hasRecent {
-                    delete(m.records, ip)
-                }
-            }
-            m.mu.Unlock()
+            m.doCleanup()
         case <-m.ctx.Done():
             return
         }
     }
 }
 
-// archiveAndFlush снимает снепшот событий  упаковывает в zip
-// отправляет в телеграм или сохраняет локально  затем очищает буфер
-func (m *SecurityMonitor) archiveAndFlush(ip string, rec *ipRecord) {
+func (m *SecurityMonitor) doCleanup() {
+    cutoff := time.Now().Add(-ipRetentionDuration)
+
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    for ip, rec := range m.records {
+        if rec.isSuspicious() {
+            continue
+        }
+        rec.mu.Lock()
+        hasRecent := false
+        for i := 0; i < rec.count; i++ {
+            if rec.events[(rec.head+i)%maxEventsPerIP].At.After(cutoff) {
+                hasRecent = true
+                break
+            }
+        }
+        rec.mu.Unlock()
+
+        if !hasRecent {
+            delete(m.records, ip)
+        }
+    }
+}
+
+func (m *SecurityMonitor) archiveWorker() {
+    defer m.wg.Done()
+    for {
+        select {
+        case task, ok := <-m.queue:
+            if !ok {
+                return
+            }
+            m.processArchive(task)
+        case <-m.ctx.Done():
+            for {
+                select {
+                case task := <-m.queue:
+                    m.processArchive(task)
+                default:
+                    return
+                }
+            }
+        }
+    }
+}
+
+func (m *SecurityMonitor) tryEnqueueFlush(ip string, rec *ipRecord) {
+    if !rec.tryLockFlush() {
+        return
+    }
+
     rec.mu.Lock()
+    if rec.count < maxEventsPerIP {
+        rec.mu.Unlock()
+        rec.unlockFlush()
+        return
+    }
     events := rec.snapshot()
     rec.count = 0
     rec.head = 0
     rec.mu.Unlock()
 
-    data, err := json.MarshalIndent(map[string]interface{}{
-        "ip":         ip,
-        "archived_at": time.Now().UTC(),
-        "events":     events,
-    }, "", "  ")
-    if err != nil {
-        m.log.Error("archive: marshal failed", slog.String("ip", ip), slog.String("err", err.Error()))
+    task := archiveTask{ip: ip, events: events}
+
+    select {
+    case m.queue <- task:
+    default:
+        m.log.Warn("security: archive queue full  dropping task",
+            slog.String("ip", ip),
+            slog.Int("events", len(events)),
+        )
+        rec.unlockFlush()
         return
     }
+
+    rec.unlockFlush()
+}
+
+func (m *SecurityMonitor) processArchive(task archiveTask) {
+    data, err := json.MarshalIndent(map[string]interface{}{
+        "ip":          task.ip,
+        "archived_at": time.Now().UTC(),
+        "total":       len(task.events),
+        "events":      task.events,
+    }, "", "  ")
+    if err != nil {
+        m.log.Error("archive: marshal failed",
+            slog.String("ip", task.ip),
+            slog.String("err", err.Error()),
+        )
+        return
+    }
+
+    ts := time.Now().UTC().Format("20060102_150405")
+    jsonName := fmt.Sprintf("%s_%s.json", sanitizeIP(task.ip), ts)
+    zipName  := fmt.Sprintf("%s_%s.zip", sanitizeIP(task.ip), ts)
 
     var buf bytes.Buffer
     zw := zip.NewWriter(&buf)
-    filename := fmt.Sprintf("%s_%s.json", ip, time.Now().UTC().Format("20060102_150405"))
-    fw, err := zw.Create(filename)
+    fw, err := zw.Create(jsonName)
     if err != nil {
-        m.log.Error("archive: create zip entry failed", slog.String("err", err.Error()))
+        m.log.Error("archive: create zip entry",
+            slog.String("err", err.Error()))
         return
     }
     if _, err := fw.Write(data); err != nil {
-        m.log.Error("archive: write zip entry failed", slog.String("err", err.Error()))
+        m.log.Error("archive: write zip entry",
+            slog.String("err", err.Error()))
         return
     }
     if err := zw.Close(); err != nil {
-        m.log.Error("archive: close zip failed", slog.String("err", err.Error()))
+        m.log.Error("archive: close zip",
+            slog.String("err", err.Error()))
         return
     }
 
-    zipName := filename[:len(filename)-5] + ".zip"
     m.log.Info("archiving ip events",
-        slog.String("ip", ip),
-        slog.Int("events", len(events)),
-        slog.String("file", zipName),
+        slog.String("ip",     task.ip),
+        slog.Int("events",   len(task.events)),
+        slog.String("file",  zipName),
     )
 
     if m.cfg.TelegramToken != "" && m.cfg.TelegramChatID != "" {
         if err := m.sendToTelegram(zipName, buf.Bytes()); err != nil {
-            m.log.Error("archive: telegram send failed",
+            m.log.Error("archive: telegram failed  saving locally",
                 slog.String("err", err.Error()),
-                slog.String("fallback", "saving locally"),
             )
             m.saveLocally(zipName, buf.Bytes())
         }
@@ -261,7 +333,6 @@ func (m *SecurityMonitor) archiveAndFlush(ip string, rec *ipRecord) {
     m.saveLocally(zipName, buf.Bytes())
 }
 
-// saveLocally сохраняет архив в ArchiveDir
 func (m *SecurityMonitor) saveLocally(name string, data []byte) {
     if err := os.MkdirAll(m.cfg.ArchiveDir, 0755); err != nil {
         m.log.Error("archive: mkdir failed", slog.String("err", err.Error()))
@@ -269,21 +340,24 @@ func (m *SecurityMonitor) saveLocally(name string, data []byte) {
     }
     path := filepath.Join(m.cfg.ArchiveDir, name)
     if err := os.WriteFile(path, data, 0644); err != nil {
-        m.log.Error("archive: write file failed", slog.String("err", err.Error()))
+        m.log.Error("archive: write failed", slog.String("err", err.Error()))
         return
     }
     m.log.Info("archive saved", slog.String("path", path))
 }
 
-// sendToTelegram отправляет zip файл в telegram через Bot API
 func (m *SecurityMonitor) sendToTelegram(filename string, data []byte) error {
+    ctx, cancel := context.WithTimeout(m.ctx, sendTimeout)
+    defer cancel()
+
     var body bytes.Buffer
     writer := multipart.NewWriter(&body)
 
     if err := writer.WriteField("chat_id", m.cfg.TelegramChatID); err != nil {
         return fmt.Errorf("write chat_id: %w", err)
     }
-    if err := writer.WriteField("caption", fmt.Sprintf("security archive: %s", filename)); err != nil {
+    if err := writer.WriteField("caption",
+        fmt.Sprintf("🚨 security archive\nip events: %s", filename)); err != nil {
         return fmt.Errorf("write caption: %w", err)
     }
 
@@ -298,8 +372,9 @@ func (m *SecurityMonitor) sendToTelegram(filename string, data []byte) error {
         return fmt.Errorf("close writer: %w", err)
     }
 
-    url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", m.cfg.TelegramToken)
-    req, err := http.NewRequestWithContext(m.ctx, http.MethodPost, url, &body)
+    url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument",
+        m.cfg.TelegramToken)
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
     if err != nil {
         return fmt.Errorf("new request: %w", err)
     }
@@ -312,34 +387,29 @@ func (m *SecurityMonitor) sendToTelegram(filename string, data []byte) error {
     defer resp.Body.Close()
 
     if resp.StatusCode != http.StatusOK {
-        return fmt.Errorf("telegram api returned %d", resp.StatusCode)
+        b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+        return fmt.Errorf("telegram api %d: %s", resp.StatusCode, b)
     }
     return nil
 }
 
 func (m *SecurityMonitor) OnAuthFailure(ip, path string) {
     rec := m.getOrCreate(ip)
-
-    if rec.isFull() {
-        go m.archiveAndFlush(ip, rec)
-    }
+    m.tryEnqueueFlush(ip, rec)
 
     failures := rec.add(time.Now(), "auth_failure", authWindowDuration)
 
     m.log.Warn("auth failure",
-        slog.String("ip", ip),
-        slog.String("path", path),
-        slog.Int("failures_last_minute", failures),
+        slog.String("ip",                  ip),
+        slog.String("path",               path),
+        slog.Int("failures_last_minute",  failures),
     )
 
-    if failures >= maxAuthFailures {
-        rec.mu.Lock()
-        rec.suspicious = true
-        rec.mu.Unlock()
-
+    if failures >= maxAuthFailures && !rec.isSuspicious() {
+        rec.markSuspicious()
         m.log.Error("POSSIBLE BRUTEFORCE DETECTED",
-            slog.String("ip", ip),
-            slog.String("path", path),
+            slog.String("ip",                 ip),
+            slog.String("path",              path),
             slog.Int("failures_last_minute", failures),
         )
     }
@@ -347,56 +417,44 @@ func (m *SecurityMonitor) OnAuthFailure(ip, path string) {
 
 func (m *SecurityMonitor) OnRateLimit(ip string) {
     rec := m.getOrCreate(ip)
+    m.tryEnqueueFlush(ip, rec)
 
-    if rec.isFull() {
-        go m.archiveAndFlush(ip, rec)
-    }
-
-    now := time.Now()
+    now  := time.Now()
     hits := rec.add(now, "rate_limit", ddosWindowDuration)
 
-    rec.mu.Lock()
-    shouldLog := now.Sub(rec.lastDDOSLog) > ddosLogCooldown
-    if shouldLog {
-        rec.lastDDOSLog = now
-    }
-    rec.mu.Unlock()
-
-    if shouldLog && hits >= ddosThreshold {
-        rec.mu.Lock()
-        rec.suspicious = true
-        rec.mu.Unlock()
-
+    if rec.shouldLogDDOS(now) && hits >= ddosThreshold {
+        if !rec.isSuspicious() {
+            rec.markSuspicious()
+        }
         m.log.Error("POSSIBLE DDOS DETECTED",
-            slog.String("ip", ip),
+            slog.String("ip",                      ip),
             slog.Int("rate_limit_hits_per_second", hits),
         )
     }
 }
 
 func (m *SecurityMonitor) ClearSuspicious(ip string) {
-    m.mu.Lock()
+    m.mu.RLock()
     rec, ok := m.records[ip]
-    m.mu.Unlock()
+    m.mu.RUnlock()
+
     if !ok {
         return
     }
-    rec.mu.Lock()
-    rec.suspicious = false
-    rec.mu.Unlock()
+
+    rec.clearSuspicious()
     m.log.Info("suspicious ip cleared", slog.String("ip", ip))
 }
 
 func (m *SecurityMonitor) ListSuspicious() []string {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-    out := make([]string, 0)
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+
+    out := make([]string, 0, len(m.records))
     for ip, rec := range m.records {
-        rec.mu.Lock()
-        if rec.suspicious {
+        if rec.isSuspicious() {
             out = append(out, ip)
         }
-        rec.mu.Unlock()
     }
     return out
 }
@@ -411,4 +469,16 @@ func SecurityMiddleware(monitor *SecurityMonitor) gin.HandlerFunc {
             monitor.OnRateLimit(c.ClientIP())
         }
     }
+}
+
+func sanitizeIP(ip string) string {
+    out := make([]byte, 0, len(ip))
+    for i := 0; i < len(ip); i++ {
+        c := ip[i]
+        if c == '.' || c == ':' {
+            c = '_'
+        }
+        out = append(out, c)
+    }
+    return string(out)
 }
