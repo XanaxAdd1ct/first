@@ -20,14 +20,14 @@ const shutdownTimeout = 10 * time.Second
 func main() {
     cfg, err := Load()
     if err != nil {
-        slog.Error("load config", slog.String("err", err.Error()))
+        slog.Error("load config", "err", err)
         os.Exit(1)
     }
 
     log := NewLogger(cfg.LogLevel)
 
     if err := run(cfg, log); err != nil {
-        log.Error("fatal error", slog.String("err", err.Error()))
+        log.Error("fatal error", "err", err)
         os.Exit(1)
     }
 }
@@ -39,9 +39,12 @@ func run(cfg *Config, log *slog.Logger) error {
     }
     defer func() {
         if err := store.Close(); err != nil {
-            log.Warn("storage close error", slog.String("err", err.Error()))
+            log.Warn("storage close error", "err", err)
         }
     }()
+
+    nonces := newNonceStore()
+    defer nonces.shutdown()
 
     keyRing, err := NewKeyRing(cfg.HMACSecret.Value())
     if err != nil {
@@ -53,9 +56,11 @@ func run(cfg *Config, log *slog.Logger) error {
             AdminToken:      cfg.AdminToken.Value(),
             DefaultDomain:   cfg.DefaultDomain,
             DefaultRedirect: cfg.DefaultRedirect,
+            AdminAllowedIPs: cfg.AdminAllowedIPs,
         },
         store,
         keyRing,
+        nonces,
         log,
         prometheus.DefaultRegisterer,
     )
@@ -68,17 +73,6 @@ func run(cfg *Config, log *slog.Logger) error {
     return serveWithGracefulShutdown(httpSrv, cfg, log)
 }
 
-// buildHTTPServer собирает http.Server с правильными таймаутами и TLS
-//
-// таймауты выставлены консервативно:
-//   - ReadHeaderTimeout 5s  защита от slowloris
-//   - ReadTimeout 15s  максимум на чтение тела запроса
-//   - WriteTimeout 15s  максимум на отправку ответа
-//   - IdleTimeout 30s  keep-alive соединения
-//   - MaxHeaderBytes 64kb  защита от огромных заголовков
-//
-// TLS включается только если заданы оба пути к сертификату и ключу
-// MinVersion TLS 1.3  запрещает устаревшие уязвимые версии
 func buildHTTPServer(cfg *Config, handler http.Handler) *http.Server {
     srv := &http.Server{
         Addr:              cfg.ListenAddr(),
@@ -92,49 +86,30 @@ func buildHTTPServer(cfg *Config, handler http.Handler) *http.Server {
 
     if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
         srv.TLSConfig = &tls.Config{
-            MinVersion:               tls.VersionTLS13,
-            PreferServerCipherSuites: true,
-            CurvePreferences: []tls.CurveID{
-                tls.X25519,
-                tls.CurveP256,
-            },
-            CipherSuites: []uint16{
-                tls.TLS_AES_128_GCM_SHA256,
-                tls.TLS_AES_256_GCM_SHA384,
-                tls.TLS_CHACHA20_POLY1305_SHA256,
-            },
+            MinVersion: tls.VersionTLS13,
         }
     }
 
     return srv
 }
 
-// serveWithGracefulShutdown запускает сервер и обрабатывает SIGINT/SIGTERM
-//
-// если заданы TLS сертификаты  запускает HTTPS  иначе HTTP
-// http.ErrServerClosed не ошибка  штатное завершение после Shutdown()
-// после сигнала даём shutdownTimeout на завершение текущих запросов
 func serveWithGracefulShutdown(srv *http.Server, cfg *Config, log *slog.Logger) error {
     serverErr := make(chan error, 1)
 
     go func() {
-        log.Info("server starting",
-            slog.String("addr", srv.Addr),
-            slog.Bool("tls", cfg.TLSCertFile != ""),
-        )
-
+        log.Info("server starting", "addr", srv.Addr, "tls", cfg.TLSCertFile != "")
         var err error
         if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
             err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
         } else {
-            log.Warn("TLS not configured  running without HTTPS")
+            log.Warn("running without HTTPS")
             err = srv.ListenAndServe()
         }
 
         if errors.Is(err, http.ErrServerClosed) {
             serverErr <- nil
         } else {
-            serverErr <- fmt.Errorf("listen and serve: %w", err)
+            serverErr <- err
         }
     }()
 
@@ -146,13 +121,12 @@ func serveWithGracefulShutdown(srv *http.Server, cfg *Config, log *slog.Logger) 
     case err := <-serverErr:
         return err
     case sig := <-quit:
-        log.Info("shutdown signal received", slog.String("signal", sig.String()))
+        log.Info("shutdown signal received", "signal", sig.String())
     }
 
     ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
     defer cancel()
 
-    log.Info("shutting down server")
     if err := srv.Shutdown(ctx); err != nil {
         return fmt.Errorf("graceful shutdown: %w", err)
     }
