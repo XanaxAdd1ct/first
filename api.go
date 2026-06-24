@@ -8,6 +8,7 @@ import (
     "net/http"
     "net/url"
     "strings"
+    "sync"
     "time"
 
     "github.com/gin-contrib/cors"
@@ -26,6 +27,10 @@ const (
     handlerTimeout  = 10 * time.Second
     minTokenLen     = 32
     maxBodyBytes    = 1 << 20
+    nonceHeader     = "X-Nonce"
+    nonceMaxStore   = 100000
+    nonceTTL        = 5 * time.Minute
+    cleanupTick     = 1 * time.Minute
 )
 
 type KeyRinger interface {
@@ -74,20 +79,12 @@ func New(
     cfg *APIConfig,
     store Storage,
     keyRing KeyRinger,
+    nonces *nonceStore,
     log *slog.Logger,
     reg prometheus.Registerer,
 ) (*Server, error) {
-    if cfg == nil {
-        return nil, errors.New("api: config must not be nil")
-    }
-    if store == nil {
-        return nil, errors.New("api: storage must not be nil")
-    }
-    if keyRing == nil {
-        return nil, errors.New("api: keyring must not be nil")
-    }
-    if log == nil {
-        return nil, errors.New("api: logger must not be nil")
+    if cfg == nil || store == nil || keyRing == nil || log == nil || nonces == nil {
+        return nil, errors.New("api: dependencies must not be nil")
     }
     if len(cfg.AdminToken) < minTokenLen {
         return nil, errors.New("api: admin token too short")
@@ -99,14 +96,14 @@ func New(
     }
 
     s := &Server{
-    cfg:             cfg,
-    store:           store,
-    keyRing:         keyRing,
-    log:             log,
-    metrics:         m,
-    securityMonitor: NewSecurityMonitor(log, SecurityConfig{}),
-    nonces:          newNonceStore(),
-}
+        cfg:             cfg,
+        store:           store,
+        keyRing:         keyRing,
+        log:             log,
+        metrics:         m,
+        securityMonitor: NewSecurityMonitor(log, SecurityConfig{}),
+        nonces:          nonces,
+    }
     s.router = s.buildRouter()
     return s, nil
 }
@@ -131,7 +128,7 @@ func (s *Server) buildRouter() *gin.Engine {
     if s.rateLimiter != nil {
         r.Use(s.rateLimiter)
     } else {
-        rate  := limiter.Rate{Period: rateLimitPeriod, Limit: rateLimitCount}
+        rate := limiter.Rate{Period: rateLimitPeriod, Limit: rateLimitCount}
         store := memory.NewStore()
         r.Use(s.rateLimitWithInstance(limiter.New(store, rate)))
     }
@@ -145,11 +142,11 @@ func (s *Server) buildRouter() *gin.Engine {
     wl := NewIPWhitelist(s.cfg.AdminAllowedIPs, s.log)
 
     admin := r.Group("/api/v1/admin")
-admin.Use(wl.Middleware())
-admin.Use(s.bearerAuth())
-admin.Use(nonceMiddleware(s.nonces))
-admin.POST("/update_domain", s.handleAdminUpdateDomain)
-admin.POST("/rotate_key", s.handleAdminRotateKey)
+    admin.Use(wl.Middleware())
+    admin.Use(s.bearerAuth())
+    admin.Use(nonceMiddleware(s.nonces))
+    admin.POST("/update_domain", s.handleAdminUpdateDomain)
+    admin.POST("/rotate_key", s.handleAdminRotateKey)
 
     return r
 }
@@ -169,8 +166,7 @@ func (s *Server) rateLimitWithInstance(instance *limiter.Limiter) gin.HandlerFun
             return
         }
         if ctx.Reached {
-            c.AbortWithStatusJSON(http.StatusTooManyRequests,
-                errorResponse("rate limit exceeded"))
+            c.AbortWithStatusJSON(http.StatusTooManyRequests, errorResponse("rate limit exceeded"))
             return
         }
         c.Next()
@@ -182,11 +178,11 @@ func (s *Server) structuredLogger() gin.HandlerFunc {
         start := time.Now()
         c.Next()
         s.log.Info("request",
-            slog.String("method",     c.Request.Method),
-            slog.String("path",       c.Request.URL.Path),
-            slog.Int("status",        c.Writer.Status()),
+            slog.String("method", c.Request.Method),
+            slog.String("path", c.Request.URL.Path),
+            slog.Int("status", c.Writer.Status()),
             slog.Duration("duration", time.Since(start)),
-            slog.String("ip",         c.ClientIP()),
+            slog.String("ip", c.ClientIP()),
         )
     }
 }
@@ -196,36 +192,24 @@ func (s *Server) bearerAuth() gin.HandlerFunc {
         header := c.GetHeader("Authorization")
         token, ok := strings.CutPrefix(header, "Bearer ")
         if !ok || token == "" {
-            c.AbortWithStatusJSON(http.StatusUnauthorized,
-                errorResponse("missing Bearer token"))
+            c.AbortWithStatusJSON(http.StatusUnauthorized, errorResponse("missing Bearer token"))
             return
         }
-        if subtle.ConstantTimeCompare(
-            []byte(token),
-            []byte(s.cfg.AdminToken),
-        ) != 1 {
-            c.AbortWithStatusJSON(http.StatusForbidden,
-                errorResponse("invalid token"))
+        if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) != 1 {
+            c.AbortWithStatusJSON(http.StatusForbidden, errorResponse("invalid token"))
             return
         }
         c.Next()
     }
 }
 
-func withTimeout(c *gin.Context, d time.Duration) (context.Context, context.CancelFunc) {
-    return context.WithTimeout(c.Request.Context(), d)
-}
-
 func (s *Server) handleHealth(c *gin.Context) {
-    ctx, cancel := withTimeout(c, healthTimeout)
+    ctx, cancel := context.WithTimeout(c.Request.Context(), healthTimeout)
     defer cancel()
 
     if err := s.store.Ping(ctx); err != nil {
-        s.log.Warn("health check: redis unavailable",
-            slog.String("err", err.Error()),
-        )
-        c.JSON(http.StatusServiceUnavailable,
-            gin.H{"status": "unhealthy", "error": err.Error()})
+        s.log.Warn("health check: redis unavailable", slog.String("err", err.Error()))
+        c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": err.Error()})
         return
     }
     c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -240,7 +224,7 @@ func (s *Server) handleAgentCheckin(c *gin.Context) {
         agentID = uuid.New().String()
     }
 
-    ctx, cancel := withTimeout(c, handlerTimeout)
+    ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
     defer cancel()
 
     domain, err := s.store.GetDomain(ctx)
@@ -297,7 +281,7 @@ func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
         return
     }
 
-    ctx, cancel := withTimeout(c, handlerTimeout)
+    ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
     defer cancel()
 
     updated, err := s.store.UpdateDomain(ctx, &DomainConfig{
@@ -311,19 +295,14 @@ func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
         return
     }
 
-    s.log.Info("domain updated by admin",
-        slog.String("domain",  updated.PrimaryDomain),
-        slog.Int64("version",  updated.Version),
-    )
+    s.log.Info("domain updated by admin", slog.String("domain", updated.PrimaryDomain), slog.Int64("version", updated.Version))
     c.JSON(http.StatusOK, gin.H{"status": "ok", "version": updated.Version})
 }
 
-type rotateKeyRequest struct {
-    NewSecret string `json:"new_secret" binding:"required"`
-}
-
 func (s *Server) handleAdminRotateKey(c *gin.Context) {
-    var req rotateKeyRequest
+    var req struct {
+        NewSecret string `json:"new_secret" binding:"required"`
+    }
     if err := c.ShouldBindJSON(&req); err != nil {
         c.JSON(http.StatusBadRequest, errorResponse(err.Error()))
         return
@@ -374,14 +353,8 @@ func validateDomain(domain string) error {
         return errors.New("primary_domain: must contain at least one dot")
     }
     for _, part := range parts {
-        if part == "" {
-            return errors.New("primary_domain: empty label")
-        }
-        if len(part) > 63 {
-            return errors.New("primary_domain: label too long (max 63)")
-        }
-        if !isValidLabel(part) {
-            return errors.New("primary_domain: invalid characters in label")
+        if part == "" || len(part) > 63 || !isValidLabel(part) {
+            return errors.New("primary_domain: invalid label")
         }
     }
     return nil
@@ -389,10 +362,7 @@ func validateDomain(domain string) error {
 
 func isValidLabel(s string) bool {
     for _, r := range s {
-        if !((r >= 'a' && r <= 'z') ||
-            (r >= 'A' && r <= 'Z') ||
-            (r >= '0' && r <= '9') ||
-            r == '-') {
+        if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
             return false
         }
     }
@@ -404,18 +374,102 @@ func validateRedirectURL(raw string) error {
         return errors.New("redirect_target must not be empty")
     }
     u, err := url.ParseRequestURI(raw)
-    if err != nil {
+    if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
         return errors.New("redirect_target: invalid URL")
-    }
-    if u.Scheme != "http" && u.Scheme != "https" {
-        return errors.New("redirect_target: scheme must be http or https")
-    }
-    if u.Host == "" {
-        return errors.New("redirect_target: host must not be empty")
     }
     return nil
 }
 
 func errorResponse(msg string) gin.H {
     return gin.H{"error": msg}
+}
+
+type nonceStore struct {
+    mu     sync.RWMutex
+    data   map[string]time.Time
+    ctx    context.Context
+    cancel context.CancelFunc
+}
+
+func newNonceStore() *nonceStore {
+    ctx, cancel := context.WithCancel(context.Background())
+    ns := &nonceStore{
+        data:   make(map[string]time.Time),
+        ctx:    ctx,
+        cancel: cancel,
+    }
+    go ns.cleanup()
+    return ns
+}
+
+func (ns *nonceStore) shutdown() {
+    ns.cancel()
+}
+
+func (ns *nonceStore) cleanup() {
+    ticker := time.NewTicker(cleanupTick)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ns.ctx.Done():
+            return
+        case <-ticker.C:
+            now := time.Now()
+            ns.mu.Lock()
+            for nonce, ts := range ns.data {
+                if now.Sub(ts) > nonceTTL {
+                    delete(ns.data, nonce)
+                }
+            }
+            ns.mu.Unlock()
+        }
+    }
+}
+
+func isValidNonceFormat(nonce string) bool {
+    if len(nonce) != 32 {
+        return false
+    }
+    for _, r := range nonce {
+        if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+            return false
+        }
+    }
+    return true
+}
+
+func nonceMiddleware(ns *nonceStore) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        nonce := c.GetHeader(nonceHeader)
+        if !isValidNonceFormat(nonce) {
+            c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid or missing X-Nonce"})
+            return
+        }
+
+        ns.mu.RLock()
+        _, exists := ns.data[nonce]
+        ns.mu.RUnlock()
+
+        if exists {
+            c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "nonce already used"})
+            return
+        }
+
+        ns.mu.Lock()
+        if len(ns.data) >= nonceMaxStore {
+            ns.mu.Unlock()
+            c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "nonce storage full"})
+            return
+        }
+
+        if _, exists := ns.data[nonce]; exists {
+            ns.mu.Unlock()
+            c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "nonce already used"})
+            return
+        }
+
+        ns.data[nonce] = time.Now()
+        ns.mu.Unlock()
+        c.Next()
+    }
 }
