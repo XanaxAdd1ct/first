@@ -52,18 +52,17 @@ func run(cfg *Config, log *slog.Logger) error {
     }
 
     srv, err := New(
-        &APIConfig{
-            AdminToken:      cfg.AdminToken.Value(),
-            DefaultDomain:   cfg.DefaultDomain,
-            DefaultRedirect: cfg.DefaultRedirect,
-            AdminAllowedIPs: cfg.AdminAllowedIPs,
-        },
-        store,
-        keyRing,
-        nonces,
-        log,
-        prometheus.DefaultRegisterer,
-    )
+    &APIConfig{...},
+    store,
+    keyRing,
+    nonces,
+    log,
+    prometheus.DefaultRegisterer,
+    SecurityConfig{
+        TelegramToken:  os.Getenv("TELEGRAM_TOKEN"), 
+        TelegramChatID: os.Getenv("TELEGRAM_CHAT_ID"),
+    },
+)
     if err != nil {
         return fmt.Errorf("init server: %w", err)
     }
