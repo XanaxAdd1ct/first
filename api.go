@@ -82,6 +82,7 @@ func New(
     nonces *nonceStore,
     log *slog.Logger,
     reg prometheus.Registerer,
+    secCfg SecurityConfig,
 ) (*Server, error) {
     if cfg == nil || store == nil || keyRing == nil || log == nil || nonces == nil {
         return nil, errors.New("api: dependencies must not be nil")
@@ -101,7 +102,7 @@ func New(
         keyRing:         keyRing,
         log:             log,
         metrics:         m,
-        securityMonitor: NewSecurityMonitor(log, SecurityConfig{}),
+        securityMonitor: NewSecurityMonitor(log, secCfg),
         nonces:          nonces,
     }
     s.router = s.buildRouter()
