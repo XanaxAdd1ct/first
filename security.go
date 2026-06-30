@@ -1,14 +1,10 @@
 package main
 
 import (
-    "archive/zip"
-    "bytes"
     "context"
     "encoding/json"
     "fmt"
-    "io"
     "log/slog"
-    "mime/multipart"
     "net/http"
     "os"
     "path/filepath"
