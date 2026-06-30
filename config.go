@@ -1,8 +1,3 @@
-// рackage main точка входа координатора
-// конфиг намеренно плоский  никаких вложенных структур
-// всё приходит из окружения  никаких yaml toml json файлов
-// причина простая  секреты не должны лежать в файлах рядом с кодом
-
 package main
 
 import (
@@ -15,96 +10,48 @@ import (
     "github.com/kelseyhightower/envconfig"
 )
 
-// Secret это обёртка над строкой для хранения чувствительных данных
-//
-// главная цель  не дать секрету утечь в логи или трейсы
-// fmt.Sprintf("%v", secret) вернёт "***"  GoString() тоже
-// реальное значение достать можно только явно через Value()
-//
-// использование намеренно неудобное  это фича не баг
-
 type Secret string
-
-// Config вся конфигурация сервиса
-//
-// теги envconfig покрывают и парсинг и документацию одновременно
-// смотришь на структуру и сразу видишь какие переменные нужны
-//
-// required:"true" означает что процесс упадёт при старте если переменная
-// не задана  лучше падать сразу чем получать странные ошибки в рантайме
 
 func (s Secret) String() string   { return "***" }
 func (s Secret) GoString() string { return "***" }
 func (s Secret) Value() string    { return string(s) }
 func (s Secret) IsEmpty() bool    { return len(s) == 0 }
 
+const minSecretLen = 32
+
 type Config struct {
-     // Host и Port разделены специально  удобнее в k8s и docker-compose
-    // где часто нужно биндить только на определённый интерфейс
     Host string `envconfig:"COORDINATOR_HOST" default:"0.0.0.0"`
     Port int    `envconfig:"COORDINATOR_PORT" default:"8080"`
 
     RedisURL string `envconfig:"REDIS_URL" required:"true"`
 
-    // HMACSecret используется для подписи payload-ов агентам
-    // при ротации старый секрет живёт ещё keyGracePeriod (1h)
-    // агенты успевают получить ответы подписанные старым ключом
     HMACSecret Secret `envconfig:"HMAC_SECRET" required:"true"`
-
-    // AdminToken это Bearer токен для /admin/* эндпоинтов
-    // минимум 32 символа  проверяется в validate()
     AdminToken Secret `envconfig:"ADMIN_TOKEN" required:"true"`
 
-    // DefaultDomain и DefaultRedirect используются при первом старте
-    // когда в Redis ещё нет конфига  после первого UpdateDomain они
-    // больше не используются
     DefaultDomain   string `envconfig:"DEFAULT_DOMAIN"   required:"true"`
     DefaultRedirect string `envconfig:"DEFAULT_REDIRECT" required:"true"`
 
-    // UpdateInterval как часто агенты должны поллить /checkin в секундах
-    // передаётся агентам для self-регуляции  сам координатор его не использует
     UpdateInterval int `envconfig:"UPDATE_INTERVAL" default:"300"`
+    RedisTTL       int `envconfig:"REDIS_TTL"       default:"3600"`
 
-    // RedisTTL это ttl записи конфига в Redis
-    // на случай если Redis переживёт координатор  данные сами протухнут
-    RedisTTL int `envconfig:"REDIS_TTL" default:"3600"`
+    LogLevel    string `envconfig:"LOG_LEVEL"`
+    TLSCertFile string `envconfig:"TLS_CERT_FILE"`
+    TLSKeyFile  string `envconfig:"TLS_KEY_FILE"`
 
-    LogLevel string `envconfig:"LOG_LEVEL" default:"info"`
-    TLSCertFile     string `envconfig:"TLS_CERT_FILE"`  
-    TLSKeyFile      string `envconfig:"TLS_KEY_FILE"`
-     AdminAllowedIPs []string `envconfig:"ADMIN_ALLOWED_IPS"`
+    AdminAllowedIPs []string `envconfig:"ADMIN_ALLOWED_IPS"`
 }
-
-
-// UpdateIntervalDuration возвращает UpdateInterval как time.Duration
-// удобнее чем каждый раз писать time.Duration(cfg.UpdateInterval) * time.Second
 
 func (c *Config) UpdateIntervalDuration() time.Duration {
     return time.Duration(c.UpdateInterval) * time.Second
 }
 
-
-// RedisTTLDuration аналогично  конвертация для передачи в storage
-
 func (c *Config) RedisTTLDuration() time.Duration {
     return time.Duration(c.RedisTTL) * time.Second
 }
 
-// ListenAddr собирает адрес для http.Server.Addr
-// отдельный метод чтобы не собирать строку в нескольких местах
-
 func (c *Config) ListenAddr() string {
     return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
-
-const minSecretLen = 32
-
-
-// Load читает конфигурацию из переменных окружения и валидирует её
-
-// если хоть одна required переменная не задана или не проходит валидацию
-// возвращает ошибку со списком всех проблем сразу а не первой попавшейся
-// это важно  лучше увидеть все 5 проблем за раз чем исправлять их по одной
 
 func Load() (*Config, error) {
     var cfg Config
@@ -116,20 +63,6 @@ func Load() (*Config, error) {
     }
     return &cfg, nil
 }
-
-
-// validate проверяет бизнес правила которые нельзя выразить тегами envconfig
-//
-// проверяет:
-//   - COORDINATOR_PORT в диапазоне 1-65535
-//   - HMAC_SECRET и ADMIN_TOKEN минимум 32 символа
-//   - DEFAULT_REDIRECT валидный http/https URL
-//   - DEFAULT_DOMAIN не пустой
-//   - UPDATE_INTERVAL и REDIS_TTL больше нуля
-//   - LOG_LEVEL один из debug info warn error
-//
-// собирает все ошибки в слайс и возвращает их одной строкой
-// оператору не придётся перезапускать сервис несколько раз
 
 func (c *Config) validate() error {
     var errs []string
@@ -172,9 +105,6 @@ func (c *Config) validate() error {
     }
     return nil
 }
-
-// validateURL отдельная функция а не метод  потому что используется
-// и в Config.validate()  и в api.go для валидации входящих запросов
 
 func validateURL(s string) error {
     if strings.TrimSpace(s) == "" {
