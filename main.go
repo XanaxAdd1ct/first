@@ -39,8 +39,9 @@ func run(cfg *Config, log *slog.Logger) error {
     }
     defer store.Close()
 
+    // nonces создаются здесь, но владение передаётся в Server.
+    // Server.Close() вызывает nonces.shutdown() — defer здесь был бы двойным вызовом.
     nonces := newNonceStore()
-    defer nonces.shutdown()
 
     keyRing, err := NewKeyRing(cfg.HMACSecret.Value())
     if err != nil {
@@ -59,10 +60,7 @@ func run(cfg *Config, log *slog.Logger) error {
         nonces,
         log,
         prometheus.DefaultRegisterer,
-        SecurityConfig{
-            TelegramToken:  cfg.TelegramToken,
-            TelegramChatID: cfg.TelegramChatID,
-        },
+        SecurityConfig{},
     )
     if err != nil {
         return fmt.Errorf("init server: %w", err)
