@@ -15,6 +15,15 @@ func testLogger() *slog.Logger {
     return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testConfig возвращает минимальный Config для тестов.
+// TLS не нужен — тесты работают по plain HTTP на случайном порту.
+func testConfig() *Config {
+    return &Config{
+        TLSCertFile: "",
+        TLSKeyFile:  "",
+    }
+}
+
 func freePort(t *testing.T) string {
     t.Helper()
     ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -47,7 +56,7 @@ func TestServeWithGracefulShutdown_StartsAndStops(t *testing.T) {
 
     done := make(chan error, 1)
     go func() {
-        done <- serveWithGracefulShutdown(srv, testLogger())
+        done <- serveWithGracefulShutdown(srv, testConfig(), testLogger())
     }()
 
     if err := waitForServer(addr, 2*time.Second); err != nil {
@@ -77,7 +86,7 @@ func TestServeWithGracefulShutdown_RespondsToRequests(t *testing.T) {
         }),
     }
 
-    go serveWithGracefulShutdown(srv, testLogger())
+    go serveWithGracefulShutdown(srv, testConfig(), testLogger())
     defer srv.Shutdown(context.Background())
 
     if err := waitForServer(addr, 2*time.Second); err != nil {
@@ -101,7 +110,7 @@ func TestServeWithGracefulShutdown_InvalidAddr(t *testing.T) {
         Handler: http.NewServeMux(),
     }
 
-    err := serveWithGracefulShutdown(srv, testLogger())
+    err := serveWithGracefulShutdown(srv, testConfig(), testLogger())
     if err == nil {
         t.Error("expected error for invalid addr, got nil")
     }
@@ -120,7 +129,7 @@ func TestServeWithGracefulShutdown_ShutdownTimeout(t *testing.T) {
         Handler: handler,
     }
 
-    go serveWithGracefulShutdown(srv, testLogger())
+    go serveWithGracefulShutdown(srv, testConfig(), testLogger())
 
     if err := waitForServer(addr, 2*time.Second); err != nil {
         t.Fatalf("server did not start: %v", err)
@@ -142,7 +151,6 @@ func TestNewLogger_NotNil(t *testing.T) {
 }
 
 func TestNewLogger_InvalidLevel(t *testing.T) {
-    // неверный уровень — должен вернуть info по умолчанию
     log := NewLogger("invalid")
     if log == nil {
         t.Error("NewLogger returned nil for invalid level")
