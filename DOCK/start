@@ -1,0 +1,154 @@
+Полный гайд по запуску на сервере
+Требования к серверу
+Ubuntu 22.04 / Debian 12
+Docker + Docker Compose
+Открытые порты: 8080 (или 443 для HTTPS)
+Шаг 1 — Клонируй репо
+bash
+
+Копировать код
+git clone https://github.com/XanaxAdd1ct/first.git
+cd first
+Шаг 2 — Создай .env файл
+bash
+
+Копировать код
+nano .env
+Вставь и заполни:
+
+bash
+
+Копировать код
+# Обязательные
+ADMIN_TOKEN=your-secret-admin-token-minimum-32-chars!!
+HMAC_SECRET=your-hmac-secret-minimum-32-chars-here!!
+REDIS_URL=redis://redis:6379/0
+DEFAULT_DOMAIN=example.com
+DEFAULT_REDIRECT=https://mirror.example.com
+
+# Опциональные
+LISTEN_ADDR=:8080
+REDIS_TTL=24h
+LOG_LEVEL=info
+
+# Для HTTPS (если есть сертификат)
+# TLS_CERT_FILE=/certs/fullchain.pem
+# TLS_KEY_FILE=/certs/privkey.pem
+ ADMIN_TOKEN и HMAC_SECRET — минимум 32 символа, иначе сервер не запустится (валидация в config.go)
+
+Шаг 3 — Вариант А: запуск через Docker Compose (рекомендуется)
+Проверь docker-compose.yml — там уже есть Redis. Запускай:
+
+bash
+
+Копировать код
+docker compose up -d
+Проверь что всё поднялось:
+
+bash
+
+Копировать код
+docker compose ps
+docker compose logs -f
+Шаг 3 — Вариант Б: запуск бинарником (без Docker)
+Установи Go 1.22+:
+
+bash
+
+Копировать код
+wget https://go.dev/dl/go1.22.0.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.22.0.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+Установи и запусти Redis:
+
+bash
+
+Копировать код
+sudo apt install redis-server -y
+sudo systemctl enable redis --now
+В .env измени:
+
+bash
+
+Копировать код
+REDIS_URL=redis://localhost:6379/0
+Собери и запусти:
+
+bash
+
+Копировать код
+go mod tidy
+CGO_ENABLED=0 go build -ldflags="-s -w" -o coordinator .
+bash
+
+Копировать код
+# Загрузи переменные и запусти
+export $(cat .env | grep -v '^#' | xargs)
+./coordinator
+Шаг 4 — Автозапуск через systemd
+bash
+
+Копировать код
+sudo nano /etc/systemd/system/coordinator.service
+ini
+
+Копировать код
+[Unit]
+Description=CGSystem Coordinator
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/coordinator
+EnvironmentFile=/opt/coordinator/.env
+ExecStart=/opt/coordinator/coordinator
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+bash
+
+Копировать код
+sudo cp coordinator /opt/coordinator/
+sudo cp .env /opt/coordinator/
+sudo systemctl daemon-reload
+sudo systemctl enable coordinator --now
+sudo systemctl status coordinator
+Шаг 5 — Проверь что работает
+bash
+
+Копировать код
+# Health check
+curl http://localhost:8080/health
+# Ожидаемый ответ: {"status":"ok"}
+
+# Метрики Prometheus
+curl http://localhost:8080/metrics
+
+# Checkin агента
+curl -X POST http://localhost:8080/api/v1/agent/checkin
+
+# Обновление домена (замени токен)
+curl -X POST http://localhost:8080/api/v1/admin/update_domain \
+  -H "Authorization: Bearer your-secret-admin-token-minimum-32-chars!!" \
+  -H "X-Nonce: $(cat /proc/sys/kernel/random/uuid)" \
+  -H "Content-Type: application/json" \
+  -d '{"primary_domain":"example.com","redirect_target":"https://mirror.example.com"}'
+Шаг 6 — HTTPS с Let's Encrypt (опционально)
+bash
+
+Копировать код
+sudo apt install certbot -y
+sudo certbot certonly --standalone -d yourdomain.com
+В .env раскомментируй:
+
+bash
+
+Копировать код
+TLS_CERT_FILE=/etc/letsencrypt/live/yourdomain.com/fullchain.pem
+TLS_KEY_FILE=/etc/letsencrypt/live/yourdomain.com/privkey.pem
+LISTEN_ADDR=:443
