@@ -26,7 +26,6 @@ const (
     ddosLogCooldown     = 5 * time.Second
     archiveWorkers      = 4
     archiveQueueSize    = 256
-    sendTimeout         = 30 * time.Second
 )
 
 type suspiciousEvent struct {
@@ -112,20 +111,18 @@ type archiveTask struct {
 }
 
 type SecurityConfig struct {
-    TelegramToken  string
-    TelegramChatID string
-    ArchiveDir     string
+    ArchiveDir string
 }
 
 type SecurityMonitor struct {
-    mu       sync.RWMutex
-    records  map[string]*ipRecord
-    log      *slog.Logger
-    cfg      SecurityConfig
-    ctx      context.Context
-    cancel   context.CancelFunc
-    queue    chan archiveTask
-    wg       sync.WaitGroup
+    mu      sync.RWMutex
+    records map[string]*ipRecord
+    log     *slog.Logger
+    cfg     SecurityConfig
+    ctx     context.Context
+    cancel  context.CancelFunc
+    queue   chan archiveTask
+    wg      sync.WaitGroup
 }
 
 func NewSecurityMonitor(log *slog.Logger, cfg SecurityConfig) *SecurityMonitor {
@@ -261,7 +258,7 @@ func (m *SecurityMonitor) tryEnqueueFlush(ip string, rec *ipRecord) {
     select {
     case m.queue <- task:
     default:
-        m.log.Warn("security: archive queue full  dropping task",
+        m.log.Warn("security: archive queue full, dropping task",
             slog.String("ip", ip),
             slog.Int("events", len(events)),
         )
@@ -273,7 +270,7 @@ func (m *SecurityMonitor) tryEnqueueFlush(ip string, rec *ipRecord) {
 }
 
 func (m *SecurityMonitor) processArchive(task archiveTask) {
-    data, err := json.MarshalIndent(map[string]interface{}{
+    data, err := json.MarshalIndent(map[string]any{
         "ip":          task.ip,
         "archived_at": time.Now().UTC(),
         "total":       len(task.events),
@@ -288,45 +285,15 @@ func (m *SecurityMonitor) processArchive(task archiveTask) {
     }
 
     ts := time.Now().UTC().Format("20060102_150405")
-    jsonName := fmt.Sprintf("%s_%s.json", sanitizeIP(task.ip), ts)
-    zipName  := fmt.Sprintf("%s_%s.zip", sanitizeIP(task.ip), ts)
-
-    var buf bytes.Buffer
-    zw := zip.NewWriter(&buf)
-    fw, err := zw.Create(jsonName)
-    if err != nil {
-        m.log.Error("archive: create zip entry",
-            slog.String("err", err.Error()))
-        return
-    }
-    if _, err := fw.Write(data); err != nil {
-        m.log.Error("archive: write zip entry",
-            slog.String("err", err.Error()))
-        return
-    }
-    if err := zw.Close(); err != nil {
-        m.log.Error("archive: close zip",
-            slog.String("err", err.Error()))
-        return
-    }
+    name := fmt.Sprintf("%s_%s.json", sanitizeIP(task.ip), ts)
 
     m.log.Info("archiving ip events",
-        slog.String("ip",     task.ip),
-        slog.Int("events",   len(task.events)),
-        slog.String("file",  zipName),
+        slog.String("ip", task.ip),
+        slog.Int("events", len(task.events)),
+        slog.String("file", name),
     )
 
-    if m.cfg.TelegramToken != "" && m.cfg.TelegramChatID != "" {
-        if err := m.sendToTelegram(zipName, buf.Bytes()); err != nil {
-            m.log.Error("archive: telegram failed  saving locally",
-                slog.String("err", err.Error()),
-            )
-            m.saveLocally(zipName, buf.Bytes())
-        }
-        return
-    }
-
-    m.saveLocally(zipName, buf.Bytes())
+    m.saveLocally(name, data)
 }
 
 func (m *SecurityMonitor) saveLocally(name string, data []byte) {
@@ -342,53 +309,6 @@ func (m *SecurityMonitor) saveLocally(name string, data []byte) {
     m.log.Info("archive saved", slog.String("path", path))
 }
 
-func (m *SecurityMonitor) sendToTelegram(filename string, data []byte) error {
-    ctx, cancel := context.WithTimeout(m.ctx, sendTimeout)
-    defer cancel()
-
-    var body bytes.Buffer
-    writer := multipart.NewWriter(&body)
-
-    if err := writer.WriteField("chat_id", m.cfg.TelegramChatID); err != nil {
-        return fmt.Errorf("write chat_id: %w", err)
-    }
-    if err := writer.WriteField("caption",
-        fmt.Sprintf("🚨 security archive\nip events: %s", filename)); err != nil {
-        return fmt.Errorf("write caption: %w", err)
-    }
-
-    part, err := writer.CreateFormFile("document", filename)
-    if err != nil {
-        return fmt.Errorf("create form file: %w", err)
-    }
-    if _, err := io.Copy(part, bytes.NewReader(data)); err != nil {
-        return fmt.Errorf("copy file: %w", err)
-    }
-    if err := writer.Close(); err != nil {
-        return fmt.Errorf("close writer: %w", err)
-    }
-
-    url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument",
-        m.cfg.TelegramToken)
-    req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
-    if err != nil {
-        return fmt.Errorf("new request: %w", err)
-    }
-    req.Header.Set("Content-Type", writer.FormDataContentType())
-
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return fmt.Errorf("do request: %w", err)
-    }
-    defer resp.Body.Close()
-
-    if resp.StatusCode != http.StatusOK {
-        b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-        return fmt.Errorf("telegram api %d: %s", resp.StatusCode, b)
-    }
-    return nil
-}
-
 func (m *SecurityMonitor) OnAuthFailure(ip, path string) {
     rec := m.getOrCreate(ip)
     m.tryEnqueueFlush(ip, rec)
@@ -396,16 +316,16 @@ func (m *SecurityMonitor) OnAuthFailure(ip, path string) {
     failures := rec.add(time.Now(), "auth_failure", authWindowDuration)
 
     m.log.Warn("auth failure",
-        slog.String("ip",                  ip),
-        slog.String("path",               path),
-        slog.Int("failures_last_minute",  failures),
+        slog.String("ip", ip),
+        slog.String("path", path),
+        slog.Int("failures_last_minute", failures),
     )
 
     if failures >= maxAuthFailures && !rec.isSuspicious() {
         rec.markSuspicious()
         m.log.Error("POSSIBLE BRUTEFORCE DETECTED",
-            slog.String("ip",                 ip),
-            slog.String("path",              path),
+            slog.String("ip", ip),
+            slog.String("path", path),
             slog.Int("failures_last_minute", failures),
         )
     }
@@ -415,7 +335,7 @@ func (m *SecurityMonitor) OnRateLimit(ip string) {
     rec := m.getOrCreate(ip)
     m.tryEnqueueFlush(ip, rec)
 
-    now  := time.Now()
+    now := time.Now()
     hits := rec.add(now, "rate_limit", ddosWindowDuration)
 
     if rec.shouldLogDDOS(now) && hits >= ddosThreshold {
@@ -423,7 +343,7 @@ func (m *SecurityMonitor) OnRateLimit(ip string) {
             rec.markSuspicious()
         }
         m.log.Error("POSSIBLE DDOS DETECTED",
-            slog.String("ip",                      ip),
+            slog.String("ip", ip),
             slog.Int("rate_limit_hits_per_second", hits),
         )
     }
