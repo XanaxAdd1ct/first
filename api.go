@@ -197,7 +197,13 @@ func (s *Server) handleAgentCheckin(c *gin.Context) {
     }
 
     payload := newDomainPayload(domain)
-    sig, keyID, _ := s.keyRing.Sign(payload.toMap())
+    
+    sig, keyID, err := s.keyRing.Sign(payload.toMap())
+if err != nil {
+    s.log.Error("sign failed", slog.Any("error", err))
+    c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+    return
+}
 
     c.JSON(http.StatusOK, gin.H{
         "action":      "update_domain",
@@ -218,10 +224,14 @@ func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
         return
     }
 
-    if err := validateURL(req.RedirectTarget); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_target: " + err.Error()})
-        return
-    }
+   if err := validateDomain(req.PrimaryDomain); err != nil {
+    c.JSON(http.StatusBadRequest, gin.H{"error": "primary_domain: " + err.Error()})
+    return
+}
+if err := validateRedirectURL(req.RedirectTarget); err != nil {
+    c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_target: " + err.Error()})
+    return
+}
 
     ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
     defer cancel()
