@@ -3,13 +3,14 @@ package main
 import (
     "bytes"
     "context"
+    "crypto/rand"
+    "encoding/hex"
     "encoding/json"
     "errors"
     "io"
     "log/slog"
     "net/http"
     "net/http/httptest"
-
     "testing"
     "time"
 
@@ -49,12 +50,16 @@ func (m *mockStorage) UpdateDomain(_ context.Context, cfg *DomainConfig) (*Domai
     return cfg, nil
 }
 
-func (m *mockStorage) Ping(_ context.Context) error {
-    return m.pingErr
-}
+func (m *mockStorage) Ping(_ context.Context) error { return m.pingErr }
+func (m *mockStorage) Close() error                 { return nil }
 
-func (m *mockStorage) Close() error {
-    return nil
+func testNonce(t *testing.T) string {
+    t.Helper()
+    b := make([]byte, 16)
+    if _, err := rand.Read(b); err != nil {
+        t.Fatalf("testNonce: %v", err)
+    }
+    return hex.EncodeToString(b)
 }
 
 func newTestServer(t *testing.T, store Storage) *Server {
@@ -74,10 +79,11 @@ func newTestServer(t *testing.T, store Storage) *Server {
     log := slog.New(slog.NewTextHandler(io.Discard, nil))
     reg := prometheus.NewRegistry()
 
-    srv, err := New(cfg, store, kr, log, reg)
+    srv, err := New(cfg, store, kr, newNonceStore(), log, reg, SecurityConfig{})
     if err != nil {
         t.Fatalf("api.New: %v", err)
     }
+    t.Cleanup(func() { srv.nonces.shutdown() })
     return srv
 }
 
@@ -96,6 +102,8 @@ func doRequest(t *testing.T, srv http.Handler, method, path string, body interfa
     if token != "" {
         req.Header.Set("Authorization", "Bearer "+token)
     }
+
+    req.Header.Set("X-Nonce", testNonce(t))
 
     rr := httptest.NewRecorder()
     srv.ServeHTTP(rr, req)
@@ -270,6 +278,15 @@ func TestAdminRotateKey_MissingSecret(t *testing.T) {
     }
 }
 
+func TestAdminRotateKey_RotateError(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"new_secret": ""}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/rotate_key", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("empty secret rotate: want 400, got %d", rr.Code)
+    }
+}
+
 func TestNew_InvalidConfig(t *testing.T) {
     kr, _ := NewKeyRing(testSecret)
     log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -285,96 +302,11 @@ func TestNew_InvalidConfig(t *testing.T) {
 
     for _, tc := range cases {
         t.Run(tc.name, func(t *testing.T) {
-            _, err := New(tc.cfg, &mockStorage{}, kr, log, reg)
+            _, err := New(tc.cfg, &mockStorage{}, kr, newNonceStore(), log, reg, SecurityConfig{})
             if err == nil {
                 t.Error("expected error, got nil")
             }
         })
-    }
-}
-func TestValidateDomain_Wildcard(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{
-        "primary_domain":  "*.example.com",
-        "redirect_target": testRedirect,
-    }
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusOK {
-        t.Errorf("wildcard domain: want 200, got %d: %s", rr.Code, rr.Body.String())
-    }
-}
-
-func TestValidateDomain_LabelTooLong(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    long := ""
-    for i := 0; i < 64; i++ {
-        long += "a"
-    }
-    long += ".com"
-    body := map[string]string{
-        "primary_domain":  long,
-        "redirect_target": testRedirect,
-    }
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("long label: want 400, got %d", rr.Code)
-    }
-}
-
-func TestValidateDomain_LeadingHyphen(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{
-        "primary_domain":  "-bad.example.com",
-        "redirect_target": testRedirect,
-    }
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("leading hyphen: want 400, got %d", rr.Code)
-    }
-}
-
-func TestValidateDomain_TrailingHyphen(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{
-        "primary_domain":  "bad-.example.com",
-        "redirect_target": testRedirect,
-    }
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("trailing hyphen: want 400, got %d", rr.Code)
-    }
-}
-
-func TestValidateDomain_EmptyLabel(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{
-        "primary_domain":  "bad..example.com",
-        "redirect_target": testRedirect,
-    }
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("empty label: want 400, got %d", rr.Code)
-    }
-}
-
-func TestValidateRedirectURL_EmptyHost(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{
-        "primary_domain":  testDomain,
-        "redirect_target": "https://",
-    }
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("empty host: want 400, got %d: %s", rr.Code, rr.Body.String())
-    }
-}
-
-func TestAdminRotateKey_RotateError(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{"new_secret": ""}
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/rotate_key", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("empty secret rotate: want 400, got %d", rr.Code)
     }
 }
 
@@ -393,17 +325,88 @@ func TestNew_NilArgs(t *testing.T) {
         kr    KeyRinger
         log   *slog.Logger
     }{
-        {"nil store",   nil,            kr,  log},
+        {"nil store", nil, kr, log},
         {"nil keyring", &mockStorage{}, nil, log},
-        {"nil logger",  &mockStorage{}, kr,  nil},
+        {"nil logger", &mockStorage{}, kr, nil},
     }
     for _, tc := range cases {
         t.Run(tc.name, func(t *testing.T) {
-            _, err := New(cfg, tc.store, tc.kr, tc.log, reg)
+            _, err := New(cfg, tc.store, tc.kr, newNonceStore(), tc.log, reg, SecurityConfig{})
             if err == nil {
                 t.Error("expected error, got nil")
             }
         })
+    }
+}
+
+func TestNewServerMetrics_Error(t *testing.T) {
+    log := slog.New(slog.NewTextHandler(io.Discard, nil))
+    kr, _ := NewKeyRing(testSecret)
+    cfg := &APIConfig{
+        AdminToken:      testAdminToken,
+        DefaultDomain:   testDomain,
+        DefaultRedirect: testRedirect,
+    }
+    reg := prometheus.NewRegistry()
+
+    _, err := New(cfg, &mockStorage{}, kr, newNonceStore(), log, reg, SecurityConfig{})
+    if err != nil {
+        t.Fatalf("first New: %v", err)
+    }
+
+    _, err = New(cfg, &mockStorage{}, kr, newNonceStore(), log, reg, SecurityConfig{})
+    if err == nil {
+        t.Error("expected error on duplicate metrics registration, got nil")
+    }
+}
+
+func TestValidateDomain_Wildcard(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": "*.example.com", "redirect_target": testRedirect}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusOK {
+        t.Errorf("wildcard domain: want 200, got %d: %s", rr.Code, rr.Body.String())
+    }
+}
+
+func TestValidateDomain_LabelTooLong(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    long := ""
+    for i := 0; i < 64; i++ {
+        long += "a"
+    }
+    long += ".com"
+    body := map[string]string{"primary_domain": long, "redirect_target": testRedirect}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("long label: want 400, got %d", rr.Code)
+    }
+}
+
+func TestValidateDomain_LeadingHyphen(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": "-bad.example.com", "redirect_target": testRedirect}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("leading hyphen: want 400, got %d", rr.Code)
+    }
+}
+
+func TestValidateDomain_TrailingHyphen(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": "bad-.example.com", "redirect_target": testRedirect}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("trailing hyphen: want 400, got %d", rr.Code)
+    }
+}
+
+func TestValidateDomain_EmptyLabel(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": "bad..example.com", "redirect_target": testRedirect}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("empty label: want 400, got %d", rr.Code)
     }
 }
 
@@ -425,6 +428,31 @@ func TestValidateDomain_WildcardOnly(t *testing.T) {
     }
 }
 
+func TestValidateDomain_NoDot(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": "nodot", "redirect_target": testRedirect}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("no dot: want 400, got %d", rr.Code)
+    }
+}
+
+func TestValidateDomain_Direct(t *testing.T) {
+    if err := validateDomain(""); err == nil {
+        t.Error("expected error for empty domain, got nil")
+    }
+}
+
+
+func TestValidateRedirectURL_EmptyHost(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": testDomain, "redirect_target": "https://"}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("empty host: want 400, got %d: %s", rr.Code, rr.Body.String())
+    }
+}
+
 func TestValidateRedirectURL_InvalidURL(t *testing.T) {
     srv := newTestServer(t, &mockStorage{})
     body := map[string]string{"primary_domain": testDomain, "redirect_target": "://no-scheme"}
@@ -434,9 +462,26 @@ func TestValidateRedirectURL_InvalidURL(t *testing.T) {
     }
 }
 
+func TestValidateRedirectURL_EmptyTarget(t *testing.T) {
+    srv := newTestServer(t, &mockStorage{})
+    body := map[string]string{"primary_domain": testDomain, "redirect_target": ""}
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
+    if rr.Code != http.StatusBadRequest {
+        t.Errorf("empty redirect: want 400, got %d", rr.Code)
+    }
+}
+
+func TestValidateRedirectURL_Direct(t *testing.T) {
+    if err := validateRedirectURL(""); err == nil {
+        t.Error("expected error for empty URL, got nil")
+    }
+}
+
 func TestVerify_KeyNotFound(t *testing.T) {
     kr, err := NewKeyRing(testSecret)
-    if err != nil { t.Fatal(err) }
+    if err != nil {
+        t.Fatal(err)
+    }
     err = kr.Verify(map[string]interface{}{"k": "v"}, "sig", 9999)
     if !errors.Is(err, ErrKeyNotFound) {
         t.Errorf("want ErrKeyNotFound, got %v", err)
@@ -445,12 +490,15 @@ func TestVerify_KeyNotFound(t *testing.T) {
 
 func TestVerify_KeyExpired(t *testing.T) {
     kr, err := NewKeyRing(testSecret)
-    if err != nil { t.Fatal(err) }
+    if err != nil {
+        t.Fatal(err)
+    }
     kr.mu.Lock()
     entry := kr.keys[kr.currentID]
     entry.validUntil = time.Now().Add(-time.Hour * 24 * 365)
     kr.keys[kr.currentID] = entry
     kr.mu.Unlock()
+
     err = kr.Verify(map[string]interface{}{"k": "v"}, "sig", kr.CurrentID())
     if !errors.Is(err, ErrKeyExpired) {
         t.Errorf("want ErrKeyExpired, got %v", err)
@@ -459,7 +507,9 @@ func TestVerify_KeyExpired(t *testing.T) {
 
 func TestEvictStale_RemovesExpiredKey(t *testing.T) {
     kr, err := NewKeyRing(testSecret)
-    if err != nil { t.Fatal(err) }
+    if err != nil {
+        t.Fatal(err)
+    }
     if err := kr.Rotate("new-32-character-secret!!!!!!!!!"); err != nil {
         t.Fatal(err)
     }
@@ -474,75 +524,66 @@ func TestEvictStale_RemovesExpiredKey(t *testing.T) {
         }
     }
     kr.mu.Unlock()
-    if oldID == -1 { t.Fatal("no old key found after rotate") }
+    if oldID == -1 {
+        t.Fatal("no old key found after rotate")
+    }
+
     kr.mu.Lock()
     kr.evictStale(time.Now())
     _, exists := kr.keys[oldID]
     kr.mu.Unlock()
-    if exists { t.Error("stale key was not evicted") }
+    if exists {
+        t.Error("stale key was not evicted")
+    }
 }
 
 func TestSign_MissingCurrentKey(t *testing.T) {
     kr, err := NewKeyRing(testSecret)
-    if err != nil { t.Fatal(err) }
+    if err != nil {
+        t.Fatal(err)
+    }
     kr.mu.Lock()
     delete(kr.keys, kr.currentID)
     kr.mu.Unlock()
+
     _, _, err = kr.Sign(map[string]interface{}{"k": "v"})
-    if err == nil { t.Error("expected error when current key missing, got nil") }
+    if err == nil {
+        t.Error("expected error when current key missing, got nil")
+    }
 }
 
 func TestSign_UnmarshalablePayload(t *testing.T) {
     kr, _ := NewKeyRing(testSecret)
     payload := map[string]interface{}{"key": make(chan int)}
     _, _, err := kr.Sign(payload)
-    if err == nil { t.Error("expected error for unmarshalable payload, got nil") }
+    if err == nil {
+        t.Error("expected error for unmarshalable payload, got nil")
+    }
 }
 
 func TestVerify_UnmarshalablePayload(t *testing.T) {
     kr, _ := NewKeyRing(testSecret)
     payload := map[string]interface{}{"key": make(chan int)}
     err := kr.Verify(payload, "sig", kr.CurrentID())
-    if err == nil { t.Error("expected error for unmarshalable payload, got nil") }
+    if err == nil {
+        t.Error("expected error for unmarshalable payload, got nil")
+    }
 }
 
-func TestValidateDomain_NoDot(t *testing.T) {
+func TestIsValidLabel_InvalidChar(t *testing.T) {
     srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{"primary_domain": "nodot", "redirect_target": testRedirect}
+    body := map[string]string{"primary_domain": "bad_domain.com", "redirect_target": testRedirect}
     rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
     if rr.Code != http.StatusBadRequest {
-        t.Errorf("no dot: want 400, got %d", rr.Code)
+        t.Errorf("invalid char: want 400, got %d", rr.Code)
     }
 }
-
-func TestValidateRedirectURL_EmptyTarget(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{"primary_domain": testDomain, "redirect_target": ""}
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("empty redirect: want 400, got %d", rr.Code)
-    }
-}
-
-func TestValidateDomain_Direct(t *testing.T) {
-    if err := validateDomain(""); err == nil {
-        t.Error("expected error for empty domain, got nil")
-    }
-}
-
-func TestValidateRedirectURL_Direct(t *testing.T) {
-    if err := validateRedirectURL(""); err == nil {
-        t.Error("expected error for empty URL, got nil")
-    }
-}
-
-// --- mock KeyRinger ---
 
 type mockKeyRing struct {
-    signErr  error
+    signErr   error
     verifyErr error
     rotateErr error
-    realKR   KeyRinger
+    realKR    KeyRinger
 }
 
 func (m *mockKeyRing) Sign(payload map[string]interface{}) (string, int, error) {
@@ -551,18 +592,21 @@ func (m *mockKeyRing) Sign(payload map[string]interface{}) (string, int, error) 
     }
     return m.realKR.Sign(payload)
 }
+
 func (m *mockKeyRing) Verify(payload map[string]interface{}, sig string, keyID int) error {
     if m.verifyErr != nil {
         return m.verifyErr
     }
     return m.realKR.Verify(payload, sig, keyID)
 }
+
 func (m *mockKeyRing) Rotate(newSecret string) error {
     if m.rotateErr != nil {
         return m.rotateErr
     }
     return m.realKR.Rotate(newSecret)
 }
+
 func (m *mockKeyRing) CurrentID() int {
     return m.realKR.CurrentID()
 }
@@ -576,14 +620,13 @@ func newTestServerWithKR(t *testing.T, store Storage, kr KeyRinger) *Server {
         DefaultDomain:   testDomain,
         DefaultRedirect: testRedirect,
     }
-    srv, err := New(cfg, store, kr, log, reg)
+    srv, err := New(cfg, store, kr, newNonceStore(), log, reg, SecurityConfig{})
     if err != nil {
         t.Fatalf("New: %v", err)
     }
+    t.Cleanup(func() { srv.nonces.shutdown() })
     return srv
 }
-
-// --- тесты ---
 
 func TestCheckin_SignError(t *testing.T) {
     realKR, _ := NewKeyRing(testSecret)
@@ -593,8 +636,7 @@ func TestCheckin_SignError(t *testing.T) {
         RedirectTarget: testRedirect,
     }}
     srv := newTestServerWithKR(t, store, kr)
-    body := map[string]string{"domain": testDomain}
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/agent/checkin", body, "")
+    rr := doRequest(t, srv, http.MethodPost, "/api/v1/agent/checkin", nil, "")
     if rr.Code != http.StatusInternalServerError {
         t.Errorf("sign error: want 500, got %d", rr.Code)
     }
@@ -608,36 +650,6 @@ func TestAdminRotateKey_RotateKeyError(t *testing.T) {
     rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/rotate_key", body, testAdminToken)
     if rr.Code != http.StatusInternalServerError {
         t.Errorf("rotate error: want 500, got %d", rr.Code)
-    }
-}
-
-func TestIsValidLabel_InvalidChar(t *testing.T) {
-    srv := newTestServer(t, &mockStorage{})
-    body := map[string]string{"primary_domain": "bad_domain.com", "redirect_target": testRedirect}
-    rr := doRequest(t, srv, http.MethodPost, "/api/v1/admin/update_domain", body, testAdminToken)
-    if rr.Code != http.StatusBadRequest {
-        t.Errorf("invalid char: want 400, got %d", rr.Code)
-    }
-}
-
-func TestNewServerMetrics_Error(t *testing.T) {
-    log := slog.New(slog.NewTextHandler(io.Discard, nil))
-    kr, _ := NewKeyRing(testSecret)
-    cfg := &APIConfig{
-        AdminToken:      testAdminToken,
-        DefaultDomain:   testDomain,
-        DefaultRedirect: testRedirect,
-    }
-    reg := prometheus.NewRegistry()
-    // Первый сервер регистрирует метрики
-    _, err := New(cfg, &mockStorage{}, kr, log, reg)
-    if err != nil {
-        t.Fatalf("first New: %v", err)
-    }
-    // Второй с тем же registry — метрики уже зарегистрированы -> ошибка
-    _, err = New(cfg, &mockStorage{}, kr, log, reg)
-    if err == nil {
-        t.Error("expected error on duplicate metrics registration, got nil")
     }
 }
 
