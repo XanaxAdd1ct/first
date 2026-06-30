@@ -6,7 +6,6 @@ import (
     "errors"
     "log/slog"
     "net/http"
-    "net/url"
     "strings"
     "sync"
     "time"
@@ -40,7 +39,6 @@ type Server struct {
     log             *slog.Logger
     metrics         *serverMetrics
     router          *gin.Engine
-    rateLimiter     gin.HandlerFunc
     securityMonitor *SecurityMonitor
     nonces          *nonceStore
 }
@@ -171,7 +169,7 @@ func (s *Server) bearerAuth() gin.HandlerFunc {
             return
         }
         c.Next()
-    }
+    }                                                
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
@@ -212,13 +210,19 @@ func (s *Server) handleAgentCheckin(c *gin.Context) {
 
 func (s *Server) handleAdminUpdateDomain(c *gin.Context) {
     var req struct {
-        PrimaryDomain  string `json:"primary_domain" binding:"required"`
+        PrimaryDomain  string `json:"primary_domain"  binding:"required"`
         RedirectTarget string `json:"redirect_target" binding:"required"`
     }
     if err := c.ShouldBindJSON(&req); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
     }
+
+    if err := validateURL(req.RedirectTarget); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_target: " + err.Error()})
+        return
+    }
+
     ctx, cancel := context.WithTimeout(c.Request.Context(), handlerTimeout)
     defer cancel()
 
@@ -246,13 +250,6 @@ func (s *Server) handleAdminRotateKey(c *gin.Context) {
         return
     }
     c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
-
-func (s *Server) createDefaultDomain(ctx context.Context) (*DomainConfig, error) {
-    return s.store.UpdateDomain(ctx, &DomainConfig{
-        PrimaryDomain:  s.cfg.DefaultDomain,
-        RedirectTarget: s.cfg.DefaultRedirect,
-    })
 }
 
 func newDomainPayload(d *DomainConfig) DomainPayload {
@@ -315,6 +312,11 @@ func nonceMiddleware(ns *nonceStore) gin.HandlerFunc {
         defer ns.mu.Unlock()
         if _, exists := ns.data[nonce]; exists {
             c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "nonce used"})
+            return
+        }
+        // Проверяем лимит до записи — защита от memory exhaustion
+        if len(ns.data) >= nonceMaxStore {
+            c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "nonce store full"})
             return
         }
         ns.data[nonce] = time.Now()
