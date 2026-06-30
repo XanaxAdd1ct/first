@@ -15,8 +15,6 @@ func testLogger() *slog.Logger {
     return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// testConfig возвращает минимальный Config для тестов.
-// TLS не нужен — тесты работают по plain HTTP на случайном порту.
 func testConfig() *Config {
     return &Config{
         TLSCertFile: "",
