@@ -34,7 +34,7 @@ type Config struct {
     UpdateInterval int `envconfig:"UPDATE_INTERVAL" default:"300"`
     RedisTTL       int `envconfig:"REDIS_TTL"       default:"3600"`
 
-    LogLevel    string `envconfig:"LOG_LEVEL"`
+    LogLevel    string `envconfig:"LOG_LEVEL" default:"info"`
     TLSCertFile string `envconfig:"TLS_CERT_FILE"`
     TLSKeyFile  string `envconfig:"TLS_KEY_FILE"`
 
